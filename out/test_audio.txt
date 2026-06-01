@@ -1,0 +1,13 @@
+Selection	View	Channel	Begin Time (s)	End Time (s)	Low Freq (Hz)	High Freq (Hz)	Annotation
+1	Spectrogram 1	1	2.27556	2.47293	4758.84	6266.16	bio
+2	Spectrogram 1	1	1.86921	2.07819	4435.84	5964.7	bio
+3	Spectrogram 1	1	1.46286	1.67184	4048.24	5641.7	bio
+4	Spectrogram 1	1	1.06812	1.2771	3789.84	5426.37	bio
+5	Spectrogram 1	1	0.267029	0.476009	3165.38	4758.84	bio
+6	Spectrogram 1	1	1.43964	1.57896	925.928	1507.32	antro
+7	Spectrogram 1	1	0.441179	0.580499	968.994	1464.26	antro
+8	Spectrogram 1	1	0.940408	1.07973	968.994	1442.72	antro
+9	Spectrogram 1	1	1.93887	2.07819	947.461	1421.19	antro
+10	Spectrogram 1	1	2.4381	2.57741	904.395	1421.19	antro
+11	Spectrogram 1	1	0.02322	0.0812698	1055.13	1227.39	antro
+12	Spectrogram 1	1	0.02322	2.93732	-21.5332	279.932	antro
