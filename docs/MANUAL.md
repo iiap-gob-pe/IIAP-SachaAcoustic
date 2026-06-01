@@ -199,8 +199,9 @@ tiempo–frecuencia** `[6,7]`. El botón **Hist** superpone el histograma de fre
 (lateral) y de dB (inferior), con las bandas del filtro resaltadas. La vista **Volumen**
 tiene su **propio juego de barras** (Frecuencia, dB, Vol) que **solo afecta a esa vista**
 (filtros locales); en las demás vistas las barras son globales. En la vista Volumen, la
-**reproducción del sonido también usa esos filtros locales** (suena solo la banda de
-dB/frecuencia que estás viendo en 3D).
+**reproducción del sonido** usa esos filtros locales **y se limita a lo que está DENTRO de
+las etiquetas** (suena solo la señal contenida en las etiquetas, en la banda de
+dB/frecuencia que ves en 3D).
 
 **Filtrado en tiempo real:** si mueves las barras de **dB** o **frecuencia** (o usas sus
 teclas) **mientras se está reproduciendo**, el cambio se **aplica al sonido en vivo** —se
@@ -285,12 +286,19 @@ La forma de etiquetar es **polígono** o **bounding box**. Se elige en la barra:
 ![Herramienta Cortar (corte libre): se pinta un trazo a mano sobre la etiqueta y el clic derecho la separa en dos por ese trazo.](man_tool_cut.png)
 
 ### Editar y cortar
-- **Editar** (`E`): arrastra los **vértices** de un polígono o las **manijas** de una caja
-  (4 esquinas + 4 lados) para reformar la etiqueta seleccionada. Arrastrar **dentro** de un
-  polígono lo **mueve entero** (conserva su forma; no se convierte en caja).
-- **Agregar / quitar puntos** (en modo **Editar**, sobre el polígono seleccionado):
-  **clic derecho sobre una arista** inserta un punto ahí; **clic derecho sobre un vértice**
-  lo elimina. Combínalo con el **zoom 2D** (rueda) para mayor precisión.
+- **Editar** (`E`): primero **selecciona** una etiqueta (clic en su interior). Luego:
+  - **Mover un vértice**: arrastra un **vértice** del polígono (o las **manijas** de una caja:
+    4 esquinas + 4 lados). Arrastrar **dentro** de un polígono lo **mueve entero** (conserva
+    su forma; no se convierte en caja).
+  - **Agregar un punto**: **clic izquierdo SOBRE LA LÍNEA (arista)** del polígono, justo donde
+    lo quieras; se inserta el vértice ahí y puedes arrastrarlo en el mismo gesto. Hacer clic
+    **dentro** del polígono (no en la línea) **no agrega** ningún punto.
+  - **Seleccionar varios vértices**: arrastra un **rectángulo con el botón DERECHO** sobre los
+    vértices que quieras; quedan marcados en **rojo**. Un clic derecho simple marca el vértice
+    más cercano.
+  - **Quitar puntos**: pulsa **Supr** para borrar **todos los vértices marcados** (o un único
+    vértice marcado). Si el polígono quedara con menos de 3 vértices, se borra la etiqueta.
+  - Combínalo con el **zoom 2D** (rueda) para mayor precisión.
 - **Cortar** (`X`) — **corte libre**: con el botón izquierdo **pintas el trazo** sobre la
   parte por donde quieres separar; con **clic derecho** se ejecuta el corte y la etiqueta
   se divide en dos piezas (cada una puede recibir otra clase). `Esc` limpia el trazo.
@@ -303,11 +311,15 @@ La forma de etiquetar es **polígono** o **bounding box**. Se elige en la barra:
   la selección (Supr)**, *Quitar selección*.
 - En zona vacía: *Auto-etiquetar*, *Nueva etiqueta…*.
 
-### Borrar etiquetas por selección
-Con la herramienta **Selec** (`S`), arrastra una **caja de selección** (tiempo +
-frecuencia) sobre el espectro y pulsa **Suprimir (Supr)**: se borran **todas las etiquetas
-cuyo centro queda dentro** de esa caja. También por **clic derecho → "Borrar etiquetas en
-la selección"**. Sin selección, **Supr** borra la etiqueta seleccionada.
+### Borrar con la herramienta Selec (`S`)
+- **Borrar un vértice**: haz **clic sobre un vértice** de cualquier polígono (se marca en
+  rojo) y pulsa **Suprimir (Supr)** para eliminar **solo ese vértice**. Si el polígono
+  quedaría con menos de 3 vértices, se borra la etiqueta entera.
+- **Borrar etiquetas por área**: arrastra una **caja de selección** (tiempo + frecuencia)
+  sobre el espectro y pulsa **Supr**: se borran **todas las etiquetas cuyo centro queda
+  dentro** de la caja. También por **clic derecho → "Borrar etiquetas en la selección"**.
+- **Supr** prioriza el **vértice marcado**; si no hay ninguno, actúa sobre la selección o,
+  en su defecto, sobre la etiqueta seleccionada.
 
 ### Auto-mejorar y Buffer (solo polígonos)
 - **Auto-mejorar etiqueta**: re-segmenta **solo la región** de esa etiqueta sobre el
@@ -472,7 +484,7 @@ T ver todo   Z zoom+   U zoom-   r ejes(3D)   [ ] resolucion 3D
 I histograma   f Senal (fija umbral)   N nueva etiqueta
 S selec   Y bbox   P poligono   V varita on/off   E editar   X cortar
 a auto   O ocultar etiquetas   c limpiar   d/Supr borra sel/seleccion   z asigna clase
-b bio   n antro   q/ESC salir
+b bio   n antro   q salir   ESC cancela (no cierra)
 ```
 Filtros y volumen: arrastra las **barras** de la derecha (frecuencia, dB, Vol).
 

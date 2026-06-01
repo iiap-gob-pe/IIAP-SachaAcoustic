@@ -70,6 +70,10 @@ struct AppS {
     int editVert = -1;               // poligono: vertice en edicion ; bbox: 100+manija, 108 mover
     int lastEditC = 0, lastEditR = 0;// ultima posicion (spec) al mover un poligono (para trasladar)
     int vr0 = 0, vr1 = 0;            // ventana VERTICAL (filas/freq) visible en la vista 2D; vr1=0 -> todo
+    bool playMask = false;           // reproduccion limitada a la mascara de etiquetas (vista Volumen)
+    int selDet = -1, selVert = -1;   // vertice marcado (selDet,selVert) de un poligono
+    std::vector<int> selVerts;       // EDITAR: conjunto de vertices del poligono selDet marcados con rectangulo (clic-der)
+    bool rbDrag=false; int rbx0=0,rby0=0,rbx1=0,rby1=0;   // rectangulo de seleccion de vertices con BOTON DERECHO (modo Editar)
 
     // seleccion en coords de espectro (tiempo c, frecuencia r)
     int sc0 = -1, sc1 = -1, sr0 = -1, sr1 = -1;
@@ -150,6 +154,7 @@ static float& flt_fHi(){ return A.view==9?A.volFHi:A.fHi; }
 static float& flt_dbMin(){ return A.view==9?A.volDbMin:A.dbMin; }
 static float& flt_dbMax(){ return A.view==9?A.volDbMax:A.dbMax; }
 static void spec_to_main(float c,float r,float&sx,float&sy);   // def. mas abajo
+static void sync_bbox_from_poly(Det&d);                        // def. mas abajo
 // modal de buffer: rectangulo de la pista del slider {tx0,tx1,ty}
 static void bufslider(float& tx0,float& tx1,float& ty){ float w=400,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-45;
     tx0=x+24; tx1=x+w-24; ty=y+56; }
@@ -271,7 +276,7 @@ static bool load_audio(const std::string& path){ try{
     A.audio=load_wav(path); A.sr=A.audio.sample_rate; A.spec=compute_spectrogram(A.audio,A.P);
     { size_t p=path.find_last_of("/\\"); A.fname=(p==std::string::npos)?path:path.substr(p+1); }   // nombre del archivo
     A.enh=enhance_asinh(A.spec,0.07); A.dets.clear();   // NO auto-etiquetar al cargar (lo hace el boton Auto)
-    A.hilos.clear(); A.sel=-1; A.sc0=A.sc1=A.sr0=A.sr1=-1; A.cursor_col=0; A.polyX.clear(); A.polyY.clear(); A.cutX.clear(); A.cutY.clear();
+    A.hilos.clear(); A.sel=-1; A.sc0=A.sc1=A.sr0=A.sr1=-1; A.cursor_col=0; A.polyX.clear(); A.polyY.clear(); A.cutX.clear(); A.cutY.clear(); A.selDet=A.selVert=-1; A.selVerts.clear(); A.rbDrag=false;
     A.vr0=0; A.vr1=A.spec.H; A.sigInit=false; A.dirty=false;   // ventana freq completa + base de autosave
     A.vc0=0; A.vc1=A.spec.W;                                   // ventana = todo el audio
     double dur=A.sr?(double)A.audio.samples.size()/A.sr:0;     // eje X segun duracion
@@ -307,13 +312,19 @@ static void play_filtered(int c0,int c1,bool useSel,float selLo,float selHi){
     // filtro activo para el SONIDO: global, salvo en la vista Volumen (V9) que usa el suyo local
     float qfLo=(A.view==9)?A.volFLo:A.fLo, qfHi=(A.view==9)?A.volFHi:A.fHi;
     float qdLo=(A.view==9)?A.volDbMin:A.dbMin, qdHi=(A.view==9)?A.volDbMax:A.dbMax;
-    bool anyFilt = (qfLo>0||qfHi<1||qdLo>0||qdHi<1||useSel);
-    for(int c=c0;c<c1;++c){ size_t off=(size_t)c*hop;
+    bool useMask=A.playMask;         // limitar a la mascara de etiquetas (solo lo que esta dentro de las etiquetas)
+    bool anyFilt = (qfLo>0||qfHi<1||qdLo>0||qdHi<1||useSel||useMask);
+    for(int c=c0;c<c1;++c){ size_t off=(size_t)c*hop; int cc=min(c,W-1);
         for(int k=0;k<nfft;++k){ size_t idx=off+k; float sv=(idx<s.size())?s[idx]:0.f; X[k]=Cf(sv*win[k],0); }
         fft(X);
         if(anyFilt) for(int k=0;k<nfft;++k){ int b=(k<=nfft/2)?k:(nfft-k); float f=(float)b/(H-1);
-            int r=(H-1)-b; if(r<0)r=0; if(r>=H)r=H-1; float e=A.enh.at(r,min(c,W-1));
+            int r=(H-1)-b; if(r<0)r=0; if(r>=H)r=H-1; float e=A.enh.at(r,cc);
             bool keep=(f>=qfLo&&f<=qfHi&&e>=qdLo&&e<=qdHi); if(useSel&&(f<selLo||f>selHi))keep=false;
+            if(keep&&useMask){ bool in=false;       // ¿(cc,r) cae dentro de alguna etiqueta?
+                for(const Det&d:A.dets){ if(cc<d.x||cc>=d.x+d.w||r<d.y||r>=d.y+d.h)continue;
+                    if(d.kind==KIND_POLY&&d.px.size()>=3){ if(pt_in_poly(d.px,d.py,cc+0.5f,r+0.5f)){in=true;break;} }
+                    else { in=true; break; } }
+                if(!in)keep=false; }
             if(!keep) X[k]=Cf(0,0); }
         ifft(X);
         size_t base=off-i0;
@@ -337,15 +348,17 @@ static void refilter_live(){ if(!A.playCtx||!PLAYER.playing||PLAYER.paused)retur
 static void play_det(int i){ if(A.audio.samples.empty()||i<0||i>=(int)A.dets.size())return; const Det&d=A.dets[i]; int H=A.spec.H;
     bool useSel=false; float sLo=0,sHi=1;
     if(A.solo_banda){ useSel=true; sHi=(float)(H-1-d.y)/(H-1); sLo=(float)(H-1-(d.y+d.h))/(H-1); }
-    play_filtered(d.x,d.x+d.w,useSel,sLo,sHi); }
+    A.playMask=false; play_filtered(d.x,d.x+d.w,useSel,sLo,sHi); }
 // Reproduce la SELECCION de arrastre (ignora la etiqueta seleccionada)
 static void play_drag_sel(){ if(A.audio.samples.empty()||A.sc0<0||A.sc1<=A.sc0)return; int H=A.spec.H;
     bool useSel=false; float sLo=0,sHi=1;
     if(A.solo_banda&&A.sr0>=0&&A.sr1>=0){ useSel=true; int rmn=min(A.sr0,A.sr1),rmx=max(A.sr0,A.sr1);
         sHi=(float)(H-1-rmn)/(H-1); sLo=(float)(H-1-rmx)/(H-1); }
-    play_filtered(A.sc0,A.sc1,useSel,sLo,sHi); }
-// Play principal: reproduce SOLO la ventana visible (cuadro del navegador)
-static void play_window(){ if(A.audio.samples.empty())return; play_filtered(vlo(),vhi(),false,0,1); }
+    A.playMask=false; play_filtered(A.sc0,A.sc1,useSel,sLo,sHi); }
+// Play principal: reproduce la ventana visible. En la vista VOLUMEN (V9) reproduce SOLO
+// lo que esta DENTRO de las etiquetas (mascara) y con los filtros locales aplicados.
+static void play_window(){ if(A.audio.samples.empty())return;
+    A.playMask=(A.view==9); play_filtered(vlo(),vhi(),false,0,1); }
 
 // ---------------- layout de botones ----------
 static std::vector<std::array<int,2>> g_seps;   // separadores de seccion (x,y)
@@ -1036,6 +1049,13 @@ static void render(){ glClearColor(0.04f,0.03f,0.06f,1); glViewport(0,0,A.cW,A.c
             if(!A.polyX.empty()){ glColor3f(1,1,0.3f);glLineWidth(2.f);glBegin(GL_LINE_STRIP);  // poligono en construccion
                 for(size_t k=0;k<A.polyX.size();++k){float sx,sy;spec_to_main((float)A.polyX[k],(float)A.polyY[k],sx,sy);glVertex2f(sx,sy);} glEnd();
                 glPointSize(7.f);glBegin(GL_POINTS);for(size_t k=0;k<A.polyX.size();++k){float sx,sy;spec_to_main((float)A.polyX[k],(float)A.polyY[k],sx,sy);glVertex2f(sx,sy);}glEnd();glPointSize(1.f); }
+            if((A.tool==T_SELECT||A.tool==T_EDIT)&&A.selDet>=0&&A.selDet<(int)A.dets.size()){   // vertices marcados (Selec/Editar): resaltados en rojo
+                const Det&d=A.dets[A.selDet]; if(d.kind==KIND_POLY){ glColor3f(1,0.3f,0.3f); glPointSize(11.f); glBegin(GL_POINTS);
+                    if(A.selVert>=0&&A.selVert<(int)d.px.size()){ float sx,sy; spec_to_main((float)d.px[A.selVert],(float)d.py[A.selVert],sx,sy); glVertex2f(sx,sy); }
+                    for(int k:A.selVerts){ if(k>=0&&k<(int)d.px.size()){ float sx,sy; spec_to_main((float)d.px[k],(float)d.py[k],sx,sy); glVertex2f(sx,sy); } }
+                    glEnd(); glPointSize(1.f); } }
+            if(A.rbDrag){ glColor3f(1,0.5f,0.3f); glLineWidth(1.f); glBegin(GL_LINE_LOOP);   // rectangulo de seleccion de vertices (clic-der)
+                glVertex2f(A.rbx0,A.rby0);glVertex2f(A.rbx1,A.rby0);glVertex2f(A.rbx1,A.rby1);glVertex2f(A.rbx0,A.rby1);glEnd(); }
             if(A.show_hist) render_hist_overlay();                          // histograma sobre el espectro
             render_axes2d();                                                // ejes 2D (solo vista 2D)
             if(A.dragging&&A.dragRegion==1){glColor3f(1,1,1);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(A.dx0,A.dy0);glVertex2f(A.dx1,A.dy0);glVertex2f(A.dx1,A.dy1);glVertex2f(A.dx0,A.dy1);glEnd();}
@@ -1070,6 +1090,17 @@ static int delete_in_selection(){
         if(n){ A.sel=-1; A.dirty=true; } return n; }
     if(A.sel>=0&&A.sel<(int)A.dets.size()){ A.dets.erase(A.dets.begin()+A.sel); A.sel=-1; A.dirty=true; return 1; }
     return 0; }
+// borra los vertices MARCADOS del poligono A.selDet: el conjunto A.selVerts (rectangulo
+// con clic-der) o, si esta vacio, el unico A.selVert. Si quedaria con <3 vertices, borra la
+// etiqueta entera. Devuelve true si actuo.
+static bool delete_marked_vertex(){ if(A.selDet<0||A.selDet>=(int)A.dets.size())return false;
+    Det&d=A.dets[A.selDet]; if(d.kind!=KIND_POLY)return false;
+    std::vector<int> vs=A.selVerts; if(vs.empty()&&A.selVert>=0)vs.push_back(A.selVert);
+    if(vs.empty())return false;
+    std::sort(vs.begin(),vs.end()); vs.erase(std::unique(vs.begin(),vs.end()),vs.end());
+    if((int)d.px.size()-(int)vs.size()<3){ A.dets.erase(A.dets.begin()+A.selDet); }   // quedaria <3 -> borra etiqueta
+    else { for(int i=(int)vs.size()-1;i>=0;--i){ int k=vs[i]; if(k>=0&&k<(int)d.px.size()){ d.px.erase(d.px.begin()+k); d.py.erase(d.py.begin()+k); } } sync_bbox_from_poly(d); }
+    A.selDet=A.selVert=-1; A.selVerts.clear(); A.dirty=true; return true; }
 static void guardar(bool silent=false){ if(A.spec.W<1)return; std::string stem=A.fname; { size_t p=stem.find_last_of('.'); if(p!=std::string::npos)stem=stem.substr(0,p); }
     if(stem.empty()||stem=="(sin archivo)")stem="etiquetas"; std::string base=A.out_dir+"/"+stem;  // nombrar por el audio
     if(!silent) show_busy("Guardando COCO + Raven...");
@@ -1126,12 +1157,12 @@ static void do_action(int c){
     else if(c>='1'&&c<='9'){ A.view=c-'0'; layout_botones(); }   // relayout: botones segun la vista
     else if(c=='G')A.quiver_completo=!A.quiver_completo;          // Quiver: glifos completos
     else if(c=='B')A.solo_banda=!A.solo_banda;
-    else if(c=='S'){A.tool=T_SELECT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();}
-    else if(c=='Y'){A.tool=T_BBOX;A.shape_poly=false;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();}   // etiquetar bounding box
-    else if(c=='P'){A.tool=T_POLY;A.shape_poly=true;A.cutX.clear();A.cutY.clear();}                 // etiquetar poligono
+    else if(c=='S'){A.tool=T_SELECT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}
+    else if(c=='Y'){A.tool=T_BBOX;A.shape_poly=false;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}   // etiquetar bounding box
+    else if(c=='P'){A.tool=T_POLY;A.shape_poly=true;A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}                 // etiquetar poligono
     else if(c=='V')A.wand=!A.wand;                    // varita magica ON/OFF (modo poligono)
-    else if(c=='E'){A.tool=T_EDIT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();}   // editar forma
-    else if(c=='X'){A.tool=T_CUT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();}    // corte libre
+    else if(c=='E'){A.tool=T_EDIT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}   // editar forma
+    else if(c=='X'){A.tool=T_CUT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}    // corte libre
     else if(c=='N'){ A.naming=true; A.nameBuf.clear(); }  // crear etiqueta (captura de texto)
     else if(c=='R')cargar_raven();                    // cargar Raven
     else if(c=='H')A.rio_completo=!A.rio_completo;   // rio: hilos completos vs corte por vertice
@@ -1169,7 +1200,7 @@ static void do_action(int c){
     else if(c=='n'&&A.classes.size()>1)A.clase_activa=1;          // antro
     else if(c=='z'&&A.sel>=0)A.dets[A.sel].cls=A.clase_activa;    // asigna la clase activa al seleccionado
     else if(c=='d'&&A.sel>=0){A.dets.erase(A.dets.begin()+A.sel);A.sel=-1;}
-    else if(c=='c'){A.dets.clear();A.hilos.clear();A.sel=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();}
+    else if(c=='c'){A.dets.clear();A.hilos.clear();A.sel=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}
     else if(c=='s')guardar();
 }
 static void ayuda(){ std::cout<<"\n=== raven.exe ===\n Botones arriba o teclas: o abrir, 1-5 vistas, ESPACIO play sel, p todo, k pausa, . stop,\n"
@@ -1225,8 +1256,27 @@ static int edit_pick(int mx,int my){ if(A.sel<0||A.sel>=(int)A.dets.size())retur
     else { float cx[8]={(float)d.x,(float)(d.x+d.w),(float)(d.x+d.w),(float)d.x, d.x+d.w*0.5f,d.x+d.w*0.5f,(float)d.x,(float)(d.x+d.w)};
         float cy[8]={(float)d.y,(float)d.y,(float)(d.y+d.h),(float)(d.y+d.h), (float)d.y,(float)(d.y+d.h),d.y+d.h*0.5f,d.y+d.h*0.5f};
         for(int k=0;k<8;++k) if(hit(cx[k],cy[k]))return 100+k; }
-    int c,r; main_to_spec(mx,my,c,r); if(c>=d.x&&c<d.x+d.w&&r>=d.y&&r<d.y+d.h)return 108; // mover
+    int c,r; main_to_spec(mx,my,c,r);
+    bool inside = (d.kind==KIND_POLY&&d.px.size()>=3) ? pt_in_poly(d.px,d.py,c+0.5f,r+0.5f)
+                                                      : (c>=d.x&&c<d.x+d.w&&r>=d.y&&r<d.y+d.h);
+    if(inside) return 108;   // mover (solo si el clic cae DENTRO de la forma, no en su bbox vacio)
     return -1; }
+// EDITAR: indice de la ARISTA del poligono seleccionado bajo el cursor (insertar despues de
+// ese indice), o -1. Usa distancia punto-segmento en pantalla (umbral ~6px).
+static int edge_pick(int mx,int my){ if(A.sel<0||A.sel>=(int)A.dets.size())return -1; const Det&d=A.dets[A.sel];
+    if(d.kind!=KIND_POLY||d.px.size()<3)return -1; int n=(int)d.px.size();
+    int ei=-1; double be=6.0*6.0;
+    for(int k=0;k<n;++k){ int j=(k+1)%n; float ax,ay,bx,by; spec_to_main((float)d.px[k],(float)d.py[k],ax,ay); spec_to_main((float)d.px[j],(float)d.py[j],bx,by);
+        double vx=bx-ax,vy=by-ay,L2=vx*vx+vy*vy; double tt=L2>0?((mx-ax)*vx+(my-ay)*vy)/L2:0; tt=tt<0?0:(tt>1?1:tt);
+        double px=ax+tt*vx,py=ay+tt*vy,dd=(mx-px)*(mx-px)+(my-py)*(my-py); if(dd<be){be=dd;ei=k;} }
+    return ei; }
+// herramienta SELEC: busca el vertice de poligono mas cercano al raton (de CUALQUIER
+// etiqueta) dentro de un radio; guarda en A.selDet/A.selVert. Devuelve true si encontro.
+static bool pick_vertex(int mx,int my){ A.selDet=-1; A.selVert=-1; double best=100; // radio^2 = 10px
+    for(int i=0;i<(int)A.dets.size();++i){ const Det&d=A.dets[i]; if(d.kind!=KIND_POLY||d.px.size()<3)continue;
+        for(size_t k=0;k<d.px.size();++k){ float sx,sy; spec_to_main((float)d.px[k],(float)d.py[k],sx,sy);
+            double dd=(mx-sx)*(mx-sx)+(my-sy)*(my-sy); if(dd<best){best=dd;A.selDet=i;A.selVert=(int)k;} } }
+    return A.selDet>=0; }
 static void sync_bbox_from_poly(Det&d){ if(d.px.size()<2)return; int mnx=d.px[0],mxx=d.px[0],mny=d.py[0],mxy=d.py[0];
     for(size_t k=0;k<d.px.size();++k){mnx=min(mnx,d.px[k]);mxx=max(mxx,d.px[k]);mny=min(mny,d.py[k]);mxy=max(mxy,d.py[k]);}
     d.x=mnx;d.y=mny;d.w=max(1,mxx-mnx);d.h=max(1,mxy-mny); }
@@ -1288,10 +1338,18 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
             else if(A.tool==T_POLY){
                 if(A.wand){ A.dragging=false;A.dragRegion=0; magic_wand(c,r); } // varita ON
                 else { A.polyX.push_back(c); A.polyY.push_back(r); A.dragging=false; A.dragRegion=0; } }  // a mano: agrega vertice
-            else if(A.tool==T_EDIT){ int hd=edit_pick(mx,my);
-                if(hd>=0){A.dragRegion=21;A.editVert=hd;A.lastEditC=c;A.lastEditR=r;} else {A.sel=caja_en(c,r);A.dragging=false;A.dragRegion=0;} }
+            else if(A.tool==T_EDIT){
+                int hd=(A.sel>=0)?edit_pick(mx,my):-1;            // solo si HAY etiqueta seleccionada
+                int ei=(hd<0&&A.sel>=0)?edge_pick(mx,my):-1;
+                if(hd>=0){ A.dragRegion=21;A.editVert=hd;A.lastEditC=c;A.lastEditR=r;       // vertice/manija -> arrastra
+                    if(A.dets[A.sel].kind==KIND_POLY&&hd<(int)A.dets[A.sel].px.size()){A.selDet=A.sel;A.selVert=hd;} else {A.selDet=A.selVert=-1;} }
+                else if(ei>=0){ Det&d=A.dets[A.sel];                                        // clic izq SOLO SOBRE LA LINEA -> agrega punto y lo arrastra
+                    d.px.insert(d.px.begin()+ei+1,c); d.py.insert(d.py.begin()+ei+1,r); sync_bbox_from_poly(d); A.dirty=true;
+                    A.dragRegion=21;A.editVert=ei+1;A.lastEditC=c;A.lastEditR=r;A.selDet=A.sel;A.selVert=ei+1; A.selVerts.clear(); }
+                else { A.sel=caja_en(c,r); A.selDet=A.selVert=-1; A.selVerts.clear(); A.dragging=false;A.dragRegion=0; } }  // dentro/fuera: solo SELECCIONA la etiqueta (NO agrega punto)
             else if(A.tool==T_CUT){ A.dragRegion=7; A.cutX.push_back(c); A.cutY.push_back(r); }  // pinta el trazo de corte
-            else { A.dragRegion=1; }       // T_SELECT: arrastra para seleccionar / clic selecciona caja
+            else { if(pick_vertex(mx,my)){ A.dragging=false; A.dragRegion=0; }   // T_SELEC: clic sobre vertice -> lo marca (Supr lo borra)
+                   else { A.selDet=A.selVert=-1; A.dragRegion=1; } }             // si no, arrastra para seleccionar
             }
         else A.dragRegion=4;                                                  // 3D rotar
         if(A.dragRegion==4&&A.view>=2&&A.spec.W>0){ int a=pick_handle(mx,my); if(a>=0){A.scaleAxis=a;A.dragRegion=6;} }  // manija de eje
@@ -1307,6 +1365,7 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         return 0; }
     case WM_MBUTTONUP: A.dragging=false; A.navMode=0; return 0;
     case WM_MOUSEMOVE:{ int mx=LOWORD(lp),my=HIWORD(lp); A.mx=mx; A.my=my;          // (para tooltips)
+        if(A.rbDrag){ A.rbx1=mx; A.rby1=my; return 0; }   // arrastre del rectangulo de seleccion de vertices (clic-der, Editar)
         if(A.dragging){
         if(A.dragRegion==5){ A.panelH=max(80,min((int)(A.cH*0.6),A.cH-my)); }        // redimensiona panel
         else if(A.navMode){ int W=A.spec.W; int col=(int)((double)mx/A.cW*W);
@@ -1353,18 +1412,10 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         if(A.tool==T_POLY&&!A.wand&&!A.polyX.empty()){ finish_poly(); return 0; }  // poligono a mano: clic der CIERRA
         if(A.tool==T_CUT&&A.cutX.size()>=2){ int idx=caja_en(A.cutX.front(),A.cutY.front()); if(idx<0)idx=caja_en(col,row); if(idx<0)idx=A.sel;
             show_busy("Cortando etiqueta..."); split_free(idx); A.cutX.clear();A.cutY.clear(); A.dirty=true; return 0; }  // corte libre
-        // EDITAR poligono con clic derecho: sobre vertice = BORRA punto; sobre arista = AGREGA punto
-        if(A.tool==T_EDIT&&!inStrip&&A.sel>=0&&A.sel<(int)A.dets.size()&&A.dets[A.sel].kind==KIND_POLY){
-            Det&d=A.dets[A.sel]; int n=(int)d.px.size();
-            int vi=-1; double bd=10*10; for(int k=0;k<n;++k){ float sx,sy; spec_to_main((float)d.px[k],(float)d.py[k],sx,sy);
-                double dd=(mx-sx)*(mx-sx)+(my-sy)*(my-sy); if(dd<bd){bd=dd;vi=k;} }
-            if(vi>=0){ if(n>3){ d.px.erase(d.px.begin()+vi); d.py.erase(d.py.begin()+vi); sync_bbox_from_poly(d); A.dirty=true; } return 0; }  // borra vertice
-            int ei=-1; double be=14*14;                                  // arista mas cercana (insertar despues de ei)
-            for(int k=0;k<n;++k){ int j=(k+1)%n; float ax,ay,bx,by; spec_to_main((float)d.px[k],(float)d.py[k],ax,ay); spec_to_main((float)d.px[j],(float)d.py[j],bx,by);
-                double vx=bx-ax,vy=by-ay,L2=vx*vx+vy*vy; double tt=L2>0?((mx-ax)*vx+(my-ay)*vy)/L2:0; tt=tt<0?0:(tt>1?1:tt);
-                double px=ax+tt*vx,py=ay+tt*vy,dd=(mx-px)*(mx-px)+(my-py)*(my-py); if(dd<be){be=dd;ei=k;} }
-            if(ei>=0){ d.px.insert(d.px.begin()+ei+1,col); d.py.insert(d.py.begin()+ei+1,row); sync_bbox_from_poly(d); A.dirty=true; }  // inserta punto
-            return 0; }
+        // EDITAR: arrastrar con BOTON DERECHO un rectangulo -> marca los vertices dentro de
+        // cualquier poligono (se borran con Supr). Agregar punto = clic IZQUIERDO sobre la linea.
+        if(A.tool==T_EDIT&&!inStrip&&my>=main_y0()&&my<panel_y0()){
+            A.rbDrag=true; A.rbx0=A.rbx1=mx; A.rby0=A.rby1=my; A.selVerts.clear(); return 0; }
         int bi=caja_en(col,row); HMENU menu=CreatePopupMenu();
         const int CLS_BASE=100, NEW_BASE=200;        // 100+idx asignar ; 200+idx crear
         bool hasSel=(A.sc0>=0&&A.sc1>A.sc0);
@@ -1398,15 +1449,35 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         else if(cmd==9&&bi>=0){ A.buffering=true; A.bufSel=bi; A.bufOrig=A.dets[bi]; A.bufOrigBuf=A.autoBuffer; }  // abre modal de buffer
         else if(cmd==10){A.naming=true;A.nameBuf.clear();}
         return 0; }
+    case WM_RBUTTONUP:{ if(!A.rbDrag)return 0; A.rbDrag=false;   // fin del rectangulo de seleccion de vertices (Editar)
+        int x0=min(A.rbx0,A.rbx1),x1=max(A.rbx0,A.rbx1),y0=min(A.rby0,A.rby1),y1=max(A.rby0,A.rby1);
+        A.selVerts.clear();
+        bool clic=(std::abs(A.rbx1-A.rbx0)<4&&std::abs(A.rby1-A.rby0)<4);
+        // elegir el poligono objetivo: el seleccionado, o el primero con vertices en el rect/cerca
+        auto verticesIn=[&](int di)->std::vector<int>{ std::vector<int> r; const Det&d=A.dets[di]; if(d.kind!=KIND_POLY)return r;
+            if(clic){ double bd=12*12; int vi=-1; for(size_t k=0;k<d.px.size();++k){ float sx,sy; spec_to_main((float)d.px[k],(float)d.py[k],sx,sy);
+                        double dd=(A.rbx1-sx)*(A.rbx1-sx)+(A.rby1-sy)*(A.rby1-sy); if(dd<bd){bd=dd;vi=(int)k;} } if(vi>=0)r.push_back(vi); }
+            else for(size_t k=0;k<d.px.size();++k){ float sx,sy; spec_to_main((float)d.px[k],(float)d.py[k],sx,sy);
+                    if(sx>=x0&&sx<=x1&&sy>=y0&&sy<=y1)r.push_back((int)k); }
+            return r; };
+        int target=-1; std::vector<int> vs;
+        if(A.sel>=0&&A.sel<(int)A.dets.size()){ vs=verticesIn(A.sel); if(!vs.empty())target=A.sel; }
+        if(target<0) for(int i=0;i<(int)A.dets.size();++i){ auto v=verticesIn(i); if(!v.empty()){target=i;vs=v;break;} }
+        if(target>=0){ A.sel=target; A.selDet=target; A.selVerts=vs;
+            std::cout<<"Vertices marcados: "<<vs.size()<<" (Supr para borrar)\n"; }
+        return 0; }
     case WM_MOUSEWHEEL:{ int dz=GET_WHEEL_DELTA_WPARAM(wp);
         if(A.view==1&&A.spec.W>0){ POINT pt={LOWORD(lp),HIWORD(lp)}; ScreenToClient(h,&pt);   // rueda = ZOOM 2D hacia el cursor
             if(pt.x>=plotX0()-2&&pt.x<=plotX1()+2&&pt.y>=plotY0()-2&&pt.y<=plotY1()+2){ int c,r; main_to_spec(pt.x,pt.y,c,r); zoom2d(dz>0?0.8f:1.25f,c,r); return 0; } }
         A.dist*=(dz>0)?0.9f:1.1f; A.dist=max(0.5f,min(20.f,A.dist)); return 0; }
     case WM_KEYDOWN:
-        if(wp==VK_DELETE){ int n=delete_in_selection(); if(n)std::cout<<"Borradas "<<n<<" etiquetas (seleccion)\n"; return 0; }  // tecla Suprimir
-        if(wp==VK_ESCAPE){
+        if(wp==VK_DELETE){ if(delete_marked_vertex()){ std::cout<<"Vertice borrado\n"; return 0; }  // Supr: si hay vertice marcado, borra solo ese
+            int n=delete_in_selection(); if(n)std::cout<<"Borradas "<<n<<" etiquetas (seleccion)\n"; return 0; }  // si no, borra etiquetas de la seleccion
+        if(wp==VK_ESCAPE){   // Esc: cancela el modo activo; NUNCA cierra la ventana (se sale con 'q')
             if(A.buffering){ if(A.bufSel>=0&&A.bufSel<(int)A.dets.size())A.dets[A.bufSel]=A.bufOrig; A.autoBuffer=A.bufOrigBuf; A.buffering=false; }  // cancela: restaura
-            else if(A.naming)A.naming=false; else if(!A.polyX.empty()){A.polyX.clear();A.polyY.clear();} else if(!A.cutX.empty()){A.cutX.clear();A.cutY.clear();} else PostQuitMessage(0); } return 0;
+            else if(A.naming)A.naming=false; else if(!A.polyX.empty()){A.polyX.clear();A.polyY.clear();} else if(!A.cutX.empty()){A.cutX.clear();A.cutY.clear();}
+            else { A.selVerts.clear(); A.selDet=A.selVert=-1; A.sc0=A.sc1=A.sr0=A.sr1=-1; }   // limpia marcas/seleccion
+            return 0; } return 0;
     case WM_CHAR:
         if(A.buffering){ if((int)wp==13)A.buffering=false; return 0; }   // Enter = aplicar buffer
         if(A.naming){ int ch=(int)wp;
