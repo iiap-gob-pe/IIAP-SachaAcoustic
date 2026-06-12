@@ -28,7 +28,8 @@ enum DetKind { KIND_BBOX = 0, KIND_POLY = 1 };
 // Deteccion: caja + poligono de segmentacion (coords del espectro).
 struct Det {
     int x = 0, y = 0, w = 0, h = 0;       // bounding box
-    std::vector<int> px, py;              // poligono (segmentacion)
+    std::vector<int> px, py;              // poligono exterior (segmentacion)
+    std::vector<std::vector<int>> hx, hy; // HUECOS/anillos: cada par hx[i]/hy[i] es el contorno de un hueco (area que NO es la clase)
     int cls = 0;                          // indice en la tabla de clases (0=bio, 1=antro por defecto)
     int kind = KIND_BBOX;                 // KIND_BBOX o KIND_POLY
 };

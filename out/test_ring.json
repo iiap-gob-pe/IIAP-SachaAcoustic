@@ -1,0 +1,13 @@
+{
+  "info": {"description": "IIAP SachaAcoustic - etiquetado paisaje sonoro", "audio_file": "test_ring.wav", "sample_rate": 22050, "signal_db_threshold": -80, "db_range": [-80, 0], "freq_range_hz": [0, 11025]}
+,
+  "images": [
+    {"id": 1, "file_name": "test_ring.wav", "width": 255, "height": 513, "signal_db_threshold": -80}
+  ],
+  "categories": [
+    {"id": 0, "name": "bio"},
+    {"id": 1, "name": "antro"}
+  ],
+  "annotations": [
+  ]
+}

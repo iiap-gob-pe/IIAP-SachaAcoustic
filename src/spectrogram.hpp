@@ -10,7 +10,7 @@
 struct SpecParams {
     int nfft = 1024;
     int hop = 256;
-    double dyn_range_db = 80.0;
+    double dyn_range_db = 80.0;   // rango dinamico: el piso de la escala de dB es -80 dB (bajo el maximo)
 };
 
 inline Img compute_spectrogram(const AudioData& a, const SpecParams& P) {

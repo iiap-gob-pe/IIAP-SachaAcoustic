@@ -1,2 +1,1 @@
 Selection	View	Channel	Begin Time (s)	End Time (s)	Low Freq (Hz)	High Freq (Hz)	Annotation
-1	Spectrogram 1	1	0.847528	1.86921	3596.04	8096.48	bio

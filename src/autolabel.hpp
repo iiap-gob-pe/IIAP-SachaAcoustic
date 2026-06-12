@@ -36,9 +36,8 @@ inline Mask erode(const Mask& m, int W, int H, int kw, int kh) {
             for (int dy = -ry; dy <= ry && all; ++dy)
                 for (int dx = -rx; dx <= rx; ++dx) {
                     int ny = y + dy, nx = x + dx;
-                    if (ny < 0 || ny >= H || nx < 0 || nx >= W || !m[ny * W + nx]) {
-                        all = false; break;
-                    }
+                    if (ny < 0 || ny >= H || nx < 0 || nx >= W) continue;  // fuera de imagen = PRESENTE -> no erosiona el borde (la señal que llega al borde se conserva)
+                    if (!m[ny * W + nx]) { all = false; break; }
                 }
             o[y * W + x] = all ? 1 : 0;
         }
@@ -67,6 +66,36 @@ inline void trace_boundary(const std::vector<int>& lab, int W, int H, int target
         if (!found) break;  // pixel aislado
         if (++steps > maxsteps) break;
     } while (!(cx == startx && cy == starty));
+}
+
+// Detecta HUECOS (fondo encerrado) dentro del bbox [minx,miny]-[maxx,maxy] de un componente:
+// inunda el fondo (mask==0) desde el borde del bbox; el fondo NO alcanzado son huecos (anillos).
+// Cada hueco con area>=holeMin se traza y se decima; contornos en coords GLOBALES -> hxs/hys.
+inline void find_holes(const Mask& mask, int W, int H, int minx, int miny, int maxx, int maxy,
+                       int dec, int holeMin,
+                       std::vector<std::vector<int>>& hxs, std::vector<std::vector<int>>& hys) {
+    int bw = maxx - minx + 1, bh = maxy - miny + 1; if (bw < 3 || bh < 3) return;
+    auto bg = [&](int xx, int yy) { return mask[(size_t)(miny + yy) * W + (minx + xx)] == 0; };  // es fondo
+    std::vector<uint8_t> reach((size_t)bw * bh, 0);
+    std::vector<std::pair<int,int>> q;
+    auto pushIf = [&](int xx, int yy) { if (xx < 0 || xx >= bw || yy < 0 || yy >= bh) return;
+        size_t i = (size_t)yy * bw + xx; if (!reach[i] && bg(xx, yy)) { reach[i] = 1; q.push_back({xx, yy}); } };
+    for (int xx = 0; xx < bw; ++xx) { pushIf(xx, 0); pushIf(xx, bh - 1); }
+    for (int yy = 0; yy < bh; ++yy) { pushIf(0, yy); pushIf(bw - 1, yy); }
+    const int d4x[4] = {1,-1,0,0}, d4y[4] = {0,0,1,-1};
+    while (!q.empty()) { auto [cx, cy] = q.back(); q.pop_back(); for (int k = 0; k < 4; ++k) pushIf(cx + d4x[k], cy + d4y[k]); }
+    std::vector<int> hl((size_t)bw * bh, 0); int hid = 0;       // agrupar el fondo NO alcanzado = huecos
+    for (int yy = 0; yy < bh; ++yy) for (int xx = 0; xx < bw; ++xx) {
+        size_t i = (size_t)yy * bw + xx; if (reach[i] || !bg(xx, yy) || hl[i]) continue; ++hid;
+        std::vector<std::pair<int,int>> s2; s2.push_back({xx, yy}); hl[i] = hid; int a = 0, ssx = xx, ssy = yy;
+        while (!s2.empty()) { auto [cx, cy] = s2.back(); s2.pop_back(); ++a;
+            for (int k = 0; k < 4; ++k) { int nx = cx + d4x[k], ny = cy + d4y[k]; if (nx < 0 || nx >= bw || ny < 0 || ny >= bh) continue;
+                size_t ni = (size_t)ny * bw + nx; if (!reach[ni] && bg(nx, ny) && !hl[ni]) { hl[ni] = hid; s2.push_back({nx, ny}); } } }
+        if (a < holeMin) continue;
+        std::vector<int> bx, by; trace_boundary(hl, bw, bh, hid, ssx, ssy, bx, by);
+        std::vector<int> hx, hy; for (size_t j = 0; j < bx.size(); j += dec) { hx.push_back(bx[j] + minx); hy.push_back(by[j] + miny); }
+        if (hx.size() >= 3) { hxs.push_back(std::move(hx)); hys.push_back(std::move(hy)); }
+    }
 }
 
 // Suavizado box 3x3 (separable) - reduce speckle antes de umbralizar. O(W*H).
@@ -166,6 +195,7 @@ inline std::vector<Det> auto_label(const Img& e_in, float K = 4.5f, int area_min
                 for (size_t i = 0; i < bx.size(); i += dec) { d.px.push_back(bx[i]); d.py.push_back(by[i]); }
                 if (d.px.size() < 3) { d.px = {d.x, d.x + d.w, d.x + d.w, d.x};
                     d.py = {d.y, d.y, d.y + d.h, d.y + d.h}; }
+                else find_holes(mask, W, H, minx, miny, maxx, maxy, dec, std::max(8, area_min / 4), d.hx, d.hy);  // ANILLOS: huecos internos
             } else {                         // bounding box (rectangulo)
                 d.kind = KIND_BBOX;
                 d.px = {d.x, d.x + d.w, d.x + d.w, d.x};

@@ -9,12 +9,13 @@
 #include "magma_lut.hpp"
 
 // Normaliza a [0,1] con percentiles suaves (p0.1-p99.9): casi no recorta.
+// Usa nth_element (O(N)) en vez de sort completo (O(N log N)) -> mas rapido en imagenes grandes.
 inline Img percentile_rescale(const Img& m, double p_lo = 0.1, double p_hi = 99.9) {
     std::vector<float> v = m.d;
-    std::sort(v.begin(), v.end());
     auto pct = [&](double p) {
         size_t i = (size_t)std::min(std::max(0.0, p / 100.0 * (v.size() - 1)),
                                     (double)(v.size() - 1));
+        std::nth_element(v.begin(), v.begin() + i, v.end());
         return v[i];
     };
     float lo = pct(p_lo), hi = pct(p_hi), den = std::max(1e-6f, hi - lo);

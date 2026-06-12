@@ -53,12 +53,18 @@ inline void export_coco(const std::string& json_path,
           << ", \"kind\": \"" << (d.kind == KIND_POLY ? "polygon" : "bbox") << "\", ";
         o << "\"bbox\": [" << d.x << ", " << d.y << ", " << d.w << ", " << d.h << "], ";
         o << "\"area\": " << (d.w * d.h) << ", ";
-        o << "\"segmentation\": [[";
+        o << "\"segmentation\": [[";                       // primer poligono = contorno exterior
         for (size_t k = 0; k < d.px.size(); ++k) {
             o << d.px[k] << ", " << d.py[k];
             if (k + 1 < d.px.size()) o << ", ";
         }
-        o << "]]}";
+        o << "]";
+        for (size_t hi = 0; hi < d.hx.size(); ++hi) {       // poligonos siguientes = HUECOS/anillos (estilo COCO multi-poligono)
+            o << ", [";
+            for (size_t k = 0; k < d.hx[hi].size(); ++k) { o << d.hx[hi][k] << ", " << d.hy[hi][k]; if (k + 1 < d.hx[hi].size()) o << ", "; }
+            o << "]";
+        }
+        o << "]}";
         if (i + 1 < dets.size()) o << ",";
         o << "\n";
     }
@@ -118,11 +124,19 @@ inline std::vector<Det> import_coco(const std::string& json_path, std::vector<La
         d.w = bb.size() > 2 ? bb[2] : 1; d.h = bb.size() > 3 ? bb[3] : 1;
         size_t adv = b1;
         if (sp != std::string::npos) {
-            size_t s0 = s.find("[[", sp), s1 = s.find("]]", sp);
-            if (s0 != std::string::npos && s1 != std::string::npos && s1 > s0) {
-                auto v = ints_in(s0 + 2, s1);
-                for (size_t k = 0; k + 1 < v.size(); k += 2) { d.px.push_back(v[k]); d.py.push_back(v[k + 1]); }
-                adv = s1 + 2;
+            size_t segOpen = s.find('[', sp), segEnd = s.find("]]", sp);    // array de segmentation: [ [ext], [hueco1], ... ]
+            if (segOpen != std::string::npos && segEnd != std::string::npos && segEnd > segOpen) {
+                size_t inner = segOpen + 1; int polyIdx = 0;
+                while (true) {
+                    size_t a = s.find('[', inner); if (a == std::string::npos || a > segEnd) break;
+                    size_t b = s.find(']', a);      if (b == std::string::npos || b > segEnd + 1) break;
+                    auto v = ints_in(a + 1, b);
+                    if (polyIdx == 0) { for (size_t k = 0; k + 1 < v.size(); k += 2) { d.px.push_back(v[k]); d.py.push_back(v[k + 1]); } }
+                    else { std::vector<int> hx, hy; for (size_t k = 0; k + 1 < v.size(); k += 2) { hx.push_back(v[k]); hy.push_back(v[k + 1]); }
+                        if (hx.size() >= 3) { d.hx.push_back(std::move(hx)); d.hy.push_back(std::move(hy)); } }   // huecos/anillos
+                    ++polyIdx; inner = b + 1;
+                }
+                adv = segEnd + 2;
             }
         }
         if (d.px.size() < 3) { d.px = {d.x, d.x + d.w, d.x + d.w, d.x}; d.py = {d.y, d.y, d.y + d.h, d.y + d.h}; d.kind = KIND_BBOX; }
