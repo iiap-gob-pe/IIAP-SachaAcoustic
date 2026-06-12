@@ -5,11 +5,11 @@
 CXX      := g++
 CXXFLAGS := -std=c++17 -O2 -Isrc
 GUILIBS  := -lgdi32 -luser32
-GLLIBS   := -lopengl32 -lglu32 -lgdi32 -luser32 -lwinmm -lcomdlg32
+GLLIBS   := -lopengl32 -lglu32 -lgdi32 -luser32 -lwinmm -lcomdlg32 -lshell32
 
 all: IIAP_SachaAcoustic.exe etiquetador.exe cli.exe
 
-# IIAP SachaAcoustic: espectrograma 2D + 3D + mandala + rio + constelacion + ondas + quiver
+# IIAP SachaAcoustic: espectrograma 2D + 3D + rio + nube + cascada + quiver + volumen
 IIAP_SachaAcoustic.exe: src/iiap_sachaacoustic.cpp src/*.hpp resource.o
 	$(CXX) $(CXXFLAGS) src/iiap_sachaacoustic.cpp resource.o -o $@ $(GLLIBS)
 resource.o: resource.rc icon.ico

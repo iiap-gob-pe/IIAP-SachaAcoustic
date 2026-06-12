@@ -80,6 +80,18 @@ struct AppS {
     int pickHole=-1, pendEdgeHole=-1;            // EDITAR: -1 = arista del contorno exterior ; >=0 = arista del HUECO/anillo
     std::vector<std::vector<Det>> undo;   // historial para Ctrl+Z (instantaneas de A.dets)
 
+    // --- optimizaciones: mascara espacial, cache de hash, cache de lista ---
+    Mask labelMask;                      // mascara W×H: 1=pixel dentro de alguna etiqueta
+    bool maskDirty = true;               // reconstruir mascara cuando A.dets cambia
+    unsigned long long cachedLabelSig = 0;  // hash cacheado de A.dets
+    bool labelsSigDirty = true;          // recalcular hash cuando A.dets cambia
+    std::vector<int> cachedListOrder;    // orden de display cacheado
+    bool listOrderDirty = true;          // reconstruir cuando cambia A.dets o listSortSize
+    std::vector<bool> listSelBitmap;     // bitmap: listSelBitmap[i]=true si i esta en listSel
+    bool listSelDirty = true;            // reconstruir cuando cambia listSel
+    unsigned long long genCounter = 0;   // generation counter para build_rios
+    std::vector<unsigned long long> usedGen;  // vector de generaciones para evitar allocs
+
     // seleccion en coords de espectro (tiempo c, frecuencia r)
     int sc0 = -1, sc1 = -1, sr0 = -1, sr1 = -1;
     int cursor_col = 0;          // posicion para empezar a reproducir / seek
@@ -132,6 +144,14 @@ static bool g_dialogOpen = false;                       // hay un dialogo Abrir/
 static void show_busy(const std::string& msg);         // indicador de carga (def. mas abajo)
 static void layout_botones();                           // (def. mas abajo) recalcula barra/paleta
 static unsigned long long labels_sig();                 // (def. mas abajo) firma de etiquetas (autosave)
+// Invalida TODOS los flags de cache dependientes de A.dets.
+// Llamar despues de cualquier mutacion de A.dets (push_back, erase, asignacion, etc.)
+static void invalidate_dets_caches() {
+    A.maskDirty = true;
+    A.labelsSigDirty = true;
+    A.listOrderDirty = true;
+    A.listSelDirty = true;
+}
 static const char* CLS = "RavenLikeGL";
 
 static const int HUD_H = 20;
@@ -260,15 +280,16 @@ static int rhi(){ int H=A.spec.H; int b=(A.vr1>A.vr0)?A.vr1:H; b=min(H,b); if(H<
 static void build_rios() {
     A.rios.clear(); const Img& e = A.enh; int W=e.W,H=e.H; float thr=0.35f;
     std::vector<Hilo> act;
+    ++A.genCounter;  // generation counter: evita limpiar el vector used en cada columna
     for (int c=0;c<W;++c){
         std::vector<int> pk;
         for(int r=1;r<H-1;++r){ float v=e.at(r,c); if(v>thr&&v>=e.at(r-1,c)&&v>=e.at(r+1,c)) pk.push_back(r);}
-        std::vector<bool> used(act.size(),false);
-        for(int pr:pk){ int best=-1,bd=6; for(size_t k=0;k<act.size();++k){ if(used[k])continue; int d=std::abs(act[k].row.back()-pr); if(d<bd){bd=d;best=(int)k;}}
-            if(best>=0){act[best].col.push_back(c);act[best].row.push_back(pr);used[best]=true;}
-            else{Hilo h;h.col.push_back(c);h.row.push_back(pr);act.push_back(h);used.push_back(true);}}
+        // Generation counter en vez de vector<bool> used: misma logica, cero allocs
+        for(int pr:pk){ int best=-1,bd=6; for(size_t k=0;k<act.size();++k){ if(A.usedGen[k]==A.genCounter)continue; int d=std::abs(act[k].row.back()-pr); if(d<bd){bd=d;best=(int)k;}}
+            if(best>=0){act[best].col.push_back(c);act[best].row.push_back(pr);A.usedGen[best]=A.genCounter;}
+            else{Hilo h;h.col.push_back(c);h.row.push_back(pr);act.push_back(h);A.usedGen.push_back(A.genCounter);}}
         std::vector<Hilo> nxt;
-        for(size_t k=0;k<act.size();++k){ if(used[k]&&act[k].col.back()==c) nxt.push_back(act[k]); else if(act[k].col.size()>=8) A.rios.push_back(act[k]); }
+        for(size_t k=0;k<act.size();++k){ if(A.usedGen[k]==A.genCounter&&act[k].col.back()==c) nxt.push_back(act[k]); else if(act[k].col.size()>=8) A.rios.push_back(act[k]); }
         act.swap(nxt);
     }
     for(auto&h:act) if(h.col.size()>=8) A.rios.push_back(h);
@@ -318,7 +339,7 @@ static void finish_poly(){ if(A.polyX.size()<3){A.polyX.clear();A.polyY.clear();
     int mnx=d.px[0],mxx=d.px[0],mny=d.py[0],mxy=d.py[0];
     for(size_t k=0;k<d.px.size();++k){mnx=min(mnx,d.px[k]);mxx=max(mxx,d.px[k]);mny=min(mny,d.py[k]);mxy=max(mxy,d.py[k]);}
     d.x=mnx;d.y=mny;d.w=max(1,mxx-mnx);d.h=max(1,mxy-mny);
-    A.dets.push_back(std::move(d)); A.sel=(int)A.dets.size()-1; A.polyX.clear();A.polyY.clear(); }
+    A.dets.push_back(std::move(d)); A.sel=(int)A.dets.size()-1; A.polyX.clear();A.polyY.clear(); invalidate_dets_caches(); }
 static bool load_audio(const std::string& path){ try{
     { size_t p=path.find_last_of("/\\"); show_busy(std::string("Cargando ")+((p==std::string::npos)?path:path.substr(p+1))+" ..."); }
     A.audio=load_wav(path); A.sr=A.audio.sample_rate;
@@ -332,7 +353,7 @@ static bool load_audio(const std::string& path){ try{
       A.P.hop=max(base,hop); }
     A.spec=compute_spectrogram(A.audio,A.P);
     { size_t p=path.find_last_of("/\\"); if(p!=std::string::npos){ A.out_dir=path.substr(0,p); A.fname=path.substr(p+1); } else A.fname=path; }   // nombre del archivo + CARPETA: carga/guarda las etiquetas JUNTO al audio
-    A.enh=enhance_asinh(A.spec,0.07); A.dets.clear();   // NO auto-etiquetar al cargar (lo hace el boton Auto)
+    A.enh=enhance_asinh(A.spec,0.07); A.dets.clear(); invalidate_dets_caches();  // NO auto-etiquetar al cargar (lo hace el boton Auto)
     A.hilos.clear(); A.sel=-1; A.sc0=A.sc1=A.sr0=A.sr1=-1; A.cursor_col=0; A.polyX.clear(); A.polyY.clear(); A.cutX.clear(); A.cutY.clear(); A.selDet=A.selVert=-1; A.selVerts.clear(); A.rbDrag=false;
     A.listSel.clear(); A.listCursor=A.listAnchor=-1; A.listScroll=0;   // lista de etiquetas: reset
     A.vr0=0; A.vr1=A.spec.H; A.sigInit=false; A.dirty=false; A.undo.clear();   // ventana freq completa + base de autosave + limpia historial
@@ -350,7 +371,7 @@ static bool load_audio(const std::string& path){ try{
     { std::string stem=A.fname; size_t dp=stem.find_last_of('.'); if(dp!=std::string::npos)stem=stem.substr(0,dp);
       std::string jp=A.out_dir+"/"+stem+".json"; std::ifstream tf(jp.c_str());
       if(tf.good()){ tf.close(); std::vector<Det> in=import_coco(jp,A.classes);
-        if(!in.empty()){ A.dets=in; if(A.clase_activa>=(int)A.classes.size())A.clase_activa=0; layout_botones();
+        if(!in.empty()){ A.dets=in; if(A.clase_activa>=(int)A.classes.size())A.clase_activa=0; layout_botones(); invalidate_dets_caches();
           std::cout<<"Etiquetas cargadas de "<<jp<<": "<<in.size()<<"\n"; } } }
     // LIMPIEZA DEFENSIVA: descarta anillos mal ubicados (centroide FUERA del exterior) -> artefactos
     // del bug viejo de coords (anillos en la esquina sup-izq, fuera de su etiqueta). Tambien quita huecos degenerados.
@@ -399,11 +420,44 @@ static bool open_dialog(){
     bool ok=GetOpenFileNameA(&o)!=0; g_dialogOpen=false;
     return ok ? load_audio(f) : false; }
 
+// ---------------- mascara espacial de etiquetas (para play_filtered O(1)) ----------
+// Construye una mascara W×H que marca que pixeles estan dentro de alguna etiqueta.
+// Se cachea y solo se reconstruye cuando A.maskDirty=true.
+static void build_label_mask() {
+    int W = A.spec.W, H = A.spec.H;
+    A.labelMask.assign((size_t)W * H, 0);
+    for (const Det& d : A.dets) {
+        if (d.kind == KIND_POLY && d.px.size() >= 3) {
+            // Rellenar poligono con scanline (simplificado: marcar bounding box y pt_in_det)
+            int x0 = max(0, d.x), x1 = min(W, d.x + d.w);
+            int y0 = max(0, d.y), y1 = min(H, d.y + d.h);
+            for (int r = y0; r < y1; ++r)
+                for (int c = x0; c < x1; ++c)
+                    if (pt_in_det(d, c + 0.5f, r + 0.5f))
+                        A.labelMask[r * W + c] = 1;
+        } else {
+            // Bounding box: marcar rectangulo
+            int x0 = max(0, d.x), x1 = min(W, d.x + d.w);
+            int y0 = max(0, d.y), y1 = min(H, d.y + d.h);
+            for (int r = y0; r < y1; ++r)
+                for (int c = x0; c < x1; ++c)
+                    A.labelMask[r * W + c] = 1;
+        }
+    }
+    A.maskDirty = false;
+}
+inline bool in_label_mask(int c, int r) {
+    int W = A.spec.W, H = A.spec.H;
+    if (c < 0 || c >= W || r < 0 || r >= H) return false;
+    return A.labelMask[r * W + c] != 0;
+}
+
 // ---------------- reproduccion con filtros aplicados al SONIDO ----------
 // STFT enmascarada (mismo criterio que el display: pass_filt sobre freq+dB) +
 // banda de la seleccion (si solo_banda) -> reconstruccion overlap-add (WOLA).
 static void play_filtered(int c0,int c1,bool useSel,float selLo,float selHi){
     const auto& s=A.audio.samples; if(s.empty())return;
+    if(A.maskDirty) build_label_mask();  // reconstruir mascara si hubo cambios en A.dets
     int W=A.spec.W,H=A.spec.H, nfft=A.P.nfft, hop=A.P.hop;
     c0=max(0,min(W-1,c0)); c1=max(c0+1,min(W,c1));
     size_t i0=(size_t)c0*hop, i1=min(s.size(),(size_t)c1*hop+nfft); if(i1<=i0)return;
@@ -431,10 +485,7 @@ static void play_filtered(int c0,int c1,bool useSel,float selLo,float selHi){
             for(int k=0;k<nfft;++k){ int b=(k<=nfft/2)?k:(nfft-k); float f=(float)b/(H-1);
                 int r=(H-1)-b; if(r<0)r=0; if(r>=H)r=H-1; float e=A.enh.at(r,cc);
                 bool keep=(f>=qfLo&&f<=qfHi&&e>=qdLo&&e<=qdHi); if(useSel&&(f<selLo||f>selHi))keep=false;
-                if(keep&&useMask){ bool in=false;       // ¿(cc,r) cae dentro de alguna etiqueta (fuera de sus huecos)?
-                    for(const Det&d:A.dets){ if(cc<d.x||cc>=d.x+d.w||r<d.y||r>=d.y+d.h)continue;
-                        if(pt_in_det(d,cc+0.5f,r+0.5f)){in=true;break;} }
-                    if(!in)keep=false; }
+                if(keep&&useMask){ if(!in_label_mask(cc,r)) keep=false; }
                 if(!keep) X[k]=Cf(0,0); }
             ifft(X);
             size_t base=off-i0;
@@ -574,7 +625,7 @@ static void auto_segment(){ if(A.spec.W<1)return;
     show_busy("Auto-etiquetando..."); push_undo();
     std::vector<Det> d=auto_label(filtered_spec(),A.K,A.area_min,A.shape_poly,A.shape_poly?A.autoBuffer:0);   // sin limite de ancho: puede etiquetar areas grandes (bandas que cruzan toda la grabacion)
     if(d.empty()) d=auto_label(A.spec,A.K,A.area_min,A.shape_poly,A.shape_poly?A.autoBuffer:0);  // respaldo: espectro crudo
-    A.dets=std::move(d); A.sel=-1; A.hide_labels=false; A.listSel.clear();       // asegurar que se vean
+    A.dets=std::move(d); A.sel=-1; A.hide_labels=false; A.listSel.clear(); invalidate_dets_caches();      // asegurar que se vean
     std::cout<<"Auto-etiquetado: "<<A.dets.size()<<" etiquetas\n"; }
 // Auto-etiquetar SOLO dentro del rectangulo de seleccion [sc0,sc1]x[sr0,sr1], sobre el
 // espectro FILTRADO (respeta fLo/fHi/dbMin/dbMax). AGREGA las etiquetas (no reemplaza) y
@@ -594,7 +645,7 @@ static void auto_segment_in_selection(bool make_poly){ if(A.spec.W<1)return;
         for(size_t k=0;k<det.px.size();++k){ det.px[k]+=c0; det.py[k]+=r0; }
         for(auto&hxv:det.hx)for(auto&v:hxv)v+=c0; for(auto&hyv:det.hy)for(auto&v:hyv)v+=r0;   // FIX: offsetear TAMBIEN los anillos/huecos (antes quedaban en coords del recorte -> aparecian en la esquina sup-izq, fuera de la etiqueta)
         A.dets.push_back(std::move(det)); }
-    A.sel=(int)A.dets.size()-1; A.hide_labels=false; A.dirty=true;
+    A.sel=(int)A.dets.size()-1; A.hide_labels=false; A.dirty=true; invalidate_dets_caches();
     std::cout<<"Auto-etiquetado seleccion: "<<d.size()<<" etiquetas\n"; }
 // Auto-mejorar una etiqueta: re-segmenta SOLO su region (con un margen) sobre el
 // espectro filtrado y reemplaza el poligono por el contorno hallado (conserva clase).
@@ -609,13 +660,13 @@ static void improve_det(int i){ if(i<0||i>=(int)A.dets.size())return; int W=A.sp
     int best=0; long ba=0; for(size_t k=0;k<ds.size();++k){ long a=(long)ds[k].w*ds[k].h; if(a>ba){ba=a;best=(int)k;} }
     Det nd=ds[best]; for(size_t k=0;k<nd.px.size();++k){ nd.px[k]+=x0; nd.py[k]+=y0; }   // offset a coords globales
     for(auto&hxv:nd.hx)for(auto&v:hxv)v+=x0; for(auto&hyv:nd.hy)for(auto&v:hyv)v+=y0;   // FIX: offsetear TAMBIEN los anillos/huecos al global
-    nd.x+=x0; nd.y+=y0; nd.cls=d.cls; nd.kind=KIND_POLY; d=nd; }
+    nd.x+=x0; nd.y+=y0; nd.cls=d.cls; nd.kind=KIND_POLY; d=nd; invalidate_dets_caches(); }
 // modal de buffer: fija autoBuffer desde la posicion del raton y re-mejora la etiqueta
 // (siempre desde la copia original, para que el slider no acumule).
 static void buffer_apply(int mx){ float tx0,tx1,ty; bufslider(tx0,tx1,ty);
     float v=(mx-tx0)/(tx1-tx0>1?tx1-tx0:1); v=v<0?0:(v>1?1:v);
     A.autoBuffer=(int)(v*BUF_MAX+0.5f);
-    if(A.bufSel>=0&&A.bufSel<(int)A.dets.size()){ A.dets[A.bufSel]=A.bufOrig; improve_det(A.bufSel); } }
+    if(A.bufSel>=0&&A.bufSel<(int)A.dets.size()){ A.dets[A.bufSel]=A.bufOrig; improve_det(A.bufSel); invalidate_dets_caches(); } }
 
 static void draw_tex_quad(float x0,float y0,float x1,float y1,float u0=0.f,float u1=1.f,float v0=0.f,float v1=1.f){
     glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,A.tex); glColor3f(1,1,1);
@@ -1108,12 +1159,28 @@ static void render_cmap_dropdown(){ if(!A.cmapOpen)return; float x,y,w,h; cmap_l
 static const int LIST_W = 300, LIST_HH = 22, LIST_RH = 16;   // ancho panel, alto cabecera, alto fila
 static void list_rect(float&x,float&y,float&w,float&h){ w=(float)LIST_W; x=(float)(A.cW-LIST_W); y=(float)main_y0();
     h=(float)(panel_y0()-main_y0()); if(h<60)h=60; }
-static std::vector<int> list_order(){ std::vector<int> idx; idx.reserve(A.dets.size());   // orden de display (por id o por tamano)
-    for(int i=0;i<(int)A.dets.size();++i)idx.push_back(i);
-    if(A.listSortSize) std::stable_sort(idx.begin(),idx.end(),
-        [](int a,int b){ return (long long)A.dets[a].w*A.dets[a].h > (long long)A.dets[b].w*A.dets[b].h; });   // mayor area primero
-    return idx; }
-static bool list_is_sel(int i){ for(int s:A.listSel) if(s==i)return true; return false; }
+// Cache: solo recalcula cuando listOrderDirty=true.
+static std::vector<int> list_order() {
+    if (A.listOrderDirty) {
+        A.cachedListOrder.resize(A.dets.size());
+        for (int i = 0; i < (int)A.dets.size(); ++i) A.cachedListOrder[i] = i;
+        if (A.listSortSize) std::stable_sort(A.cachedListOrder.begin(), A.cachedListOrder.end(),
+            [](int a, int b) { return (long long)A.dets[a].w * A.dets[a].h > (long long)A.dets[b].w * A.dets[b].h; });
+        A.listOrderDirty = false;
+    }
+    return A.cachedListOrder;
+}
+// Bitmap: reconstruccion lazy cuando listSelDirty=true. Lookup O(1).
+static void rebuild_list_sel_bitmap() {
+    A.listSelBitmap.assign(A.dets.size(), false);
+    for (int s : A.listSel) if (s >= 0 && s < (int)A.dets.size()) A.listSelBitmap[s] = true;
+    A.listSelDirty = false;
+}
+static bool list_is_sel(int i) {
+    if (A.listSelDirty) rebuild_list_sel_bitmap();
+    if (i < 0 || i >= (int)A.listSelBitmap.size()) return false;
+    return A.listSelBitmap[i];
+}
 static void list_toggle(int i){ for(size_t k=0;k<A.listSel.size();++k) if(A.listSel[k]==i){ A.listSel.erase(A.listSel.begin()+(long)k); return; } A.listSel.push_back(i); }
 static void list_select_range(int a,int b){ if(a>b){int t=a;a=b;b=t;} auto order=list_order(); A.listSel.clear();
     for(int r=a;r<=b&&r<(int)order.size();++r) if(r>=0)A.listSel.push_back(order[r]); }
@@ -1153,7 +1220,7 @@ static int list_delete_selected(){ if(A.listSel.empty())return 0; push_undo();  
     std::vector<int> idx=A.listSel; std::sort(idx.begin(),idx.end()); idx.erase(std::unique(idx.begin(),idx.end()),idx.end());
     for(int i=(int)idx.size()-1;i>=0;--i){ if(idx[i]>=0&&idx[i]<(int)A.dets.size())A.dets.erase(A.dets.begin()+idx[i]); }   // descendente: no invalida indices menores
     int k=(int)idx.size(); A.listSel.clear(); A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear();
-    if(A.listCursor>=(int)A.dets.size())A.listCursor=(int)A.dets.size()-1; A.listAnchor=-1; A.dirty=true; return k; }
+    if(A.listCursor>=(int)A.dets.size())A.listCursor=(int)A.dets.size()-1; A.listAnchor=-1; A.dirty=true; invalidate_dets_caches(); return k; }
 
 // Crestas del rio dibujadas SOBRE el espectrograma 2D, con el mismo filtro
 // (hilos completos o corte por vertice). Refleja el filtro de hilos en 2D.
@@ -1362,7 +1429,7 @@ static void render(){ glClearColor(0.04f,0.03f,0.06f,1); glViewport(0,0,A.cW,A.c
 // historial para Ctrl+Z: guarda una instantanea de las etiquetas ANTES de modificarlas.
 static void push_undo(){ A.undo.push_back(A.dets); if(A.undo.size()>50)A.undo.erase(A.undo.begin()); }
 static void do_undo(){ if(A.undo.empty())return; A.dets=A.undo.back(); A.undo.pop_back();
-    A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.listSel.clear(); A.dirty=true; std::cout<<"Deshacer ("<<A.undo.size()<<" restantes)\n"; }
+    A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.listSel.clear(); A.dirty=true; invalidate_dets_caches(); std::cout<<"Deshacer ("<<A.undo.size()<<" restantes)\n"; }
 // Selecciona la etiqueta bajo (c,r). Si hay varias solapadas (p.ej. una PEQUENA dentro de
 // otra GRANDE) elige la de MENOR area, para poder seleccionar/editar la interior. Para
 // poligonos exige que el punto caiga dentro de la forma real (pt_in_poly), no solo del bbox.
@@ -1382,8 +1449,8 @@ static int delete_in_selection(){
         for(int i=(int)A.dets.size()-1;i>=0;--i){ const Det&d=A.dets[i];
             int cx=d.x+d.w/2, cy=d.y+d.h/2;                       // centro de la etiqueta
             if(cx>=c0&&cx<=c1&&cy>=r0&&cy<=r1){ A.dets.erase(A.dets.begin()+i); ++n; } }
-        if(n){ A.sel=-1; A.dirty=true; } return n; }
-    if(A.sel>=0&&A.sel<(int)A.dets.size()){ A.dets.erase(A.dets.begin()+A.sel); A.sel=-1; A.dirty=true; return 1; }
+        if(n){ A.sel=-1; A.dirty=true; invalidate_dets_caches(); } return n; }
+    if(A.sel>=0&&A.sel<(int)A.dets.size()){ A.dets.erase(A.dets.begin()+A.sel); A.sel=-1; A.dirty=true; invalidate_dets_caches(); return 1; }
     return 0; }
 // asigna la clase `cls` a TODAS las etiquetas cuyo CENTRO cae en la caja de seleccion (tiempo +
 // frecuencia si la hay). Para "Cambiar etiqueta" en lote (uno o varios poligonos). Devuelve cuantas cambio.
@@ -1422,7 +1489,7 @@ static bool delete_marked_vertex(){ if(A.selDet<0||A.selDet>=(int)A.dets.size())
         if(A.selVert>=(int)d.px.size())return false;
         if((int)d.px.size()<=3){ A.dets.erase(A.dets.begin()+A.selDet); A.sel=-1; }   // <3 -> borra etiqueta
         else { d.px.erase(d.px.begin()+A.selVert); d.py.erase(d.py.begin()+A.selVert); sync_bbox_from_poly(d); } }
-    A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.dirty=true; return true; }
+    A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.dirty=true; invalidate_dets_caches(); return true; }
 static void guardar(bool silent=false){ if(A.spec.W<1)return; std::string stem=A.fname; { size_t p=stem.find_last_of('.'); if(p!=std::string::npos)stem=stem.substr(0,p); }
     if(stem.empty()||stem=="(sin archivo)")stem="etiquetas"; std::string base=A.out_dir+"/"+stem;  // nombrar por el audio
     if(!silent) show_busy("Guardando COCO + Raven...");
@@ -1435,15 +1502,20 @@ static void guardar(bool silent=false){ if(A.spec.W<1)return; std::string stem=A
     A.dirty=false;
     std::cout<<(silent?"Autosave ":"Guardado ")<<base<<".json + .txt(Raven) ("<<A.dets.size()<<" etiquetas)\n"; }
 // firma (hash) del estado de etiquetas: detecta CUALQUIER cambio para el autosave
-static unsigned long long labels_sig(){ unsigned long long s=1469598103934665603ULL;
+// Cache: solo recalcula cuando labelsSigDirty=true (marca invalidate_dets_caches).
+static unsigned long long compute_labels_sig(){ unsigned long long s=1469598103934665603ULL;
     auto mix=[&](long long v){ s=(s^(unsigned long long)v)*1099511628211ULL; };
     mix((long long)A.dets.size()); mix((long long)A.classes.size());
     for(const Det&d:A.dets){ mix(d.x);mix(d.y);mix(d.w);mix(d.h);mix(d.cls);mix(d.kind);mix((long long)d.px.size());
         for(size_t k=0;k<d.px.size();++k){ mix(d.px[k]); mix(d.py[k]); }
-        mix((long long)d.hx.size());                                          // ANILLOS/huecos: para que mover/insertar/borrar un vertice de anillo TAMBIEN dispare el autosave
+        mix((long long)d.hx.size());
         for(size_t hh=0;hh<d.hx.size();++hh){ mix((long long)d.hx[hh].size());
             for(size_t k=0;k<d.hx[hh].size();++k){ mix(d.hx[hh][k]); mix(d.hy[hh][k]); } } }
     return s; }
+static unsigned long long labels_sig() {
+    if (A.labelsSigDirty) { A.cachedLabelSig = compute_labels_sig(); A.labelsSigDirty = false; }
+    return A.cachedLabelSig;
+}
 // autosave: si la firma cambio y no se esta arrastrando/escribiendo, guarda en silencio
 static void autosave_tick(){ static int t=0; if(++t<100)return; t=0;   // ~cada 1 s
     if(A.spec.W<1||A.fname=="(sin archivo)"||A.dragging||A.naming||A.buffering)return;
@@ -1460,11 +1532,11 @@ static void cargar_raven(){
     show_busy("Cargando etiquetas Raven...");
     RavenGeom g{A.spec.W,A.spec.H,A.sr,A.P.hop};
     std::vector<Det> in=import_raven(f,g,A.classes); for(auto&d:in)A.dets.push_back(d);
-    A.sel=-1; layout_botones(); std::cout<<"Cargadas "<<in.size()<<" etiquetas Raven de "<<f<<"\n"; }
+    A.sel=-1; layout_botones(); invalidate_dets_caches(); std::cout<<"Cargadas "<<in.size()<<" etiquetas Raven de "<<f<<"\n"; }
 static void crear_caja(int cls){ if(A.sc0<0||A.sc1<=A.sc0)return; push_undo(); Det d; d.x=A.sc0; d.w=A.sc1-A.sc0;
     if(A.sr0>=0&&A.sr1>=0){d.y=min(A.sr0,A.sr1);d.h=max(1,std::abs(A.sr1-A.sr0));}else{d.y=0;d.h=A.spec.H;}
     d.px={d.x,d.x+d.w,d.x+d.w,d.x}; d.py={d.y,d.y,d.y+d.h,d.y+d.h}; d.cls=cls;
-    A.dets.push_back(d); A.sel=(int)A.dets.size()-1; }
+    A.dets.push_back(d); A.sel=(int)A.dets.size()-1; invalidate_dets_caches(); }
 // Fijar valor de senal: el humano baja el TECHO de dB escuchando hasta que el
 // sonido se vuelve ruido; al pulsar, ese techo (umbral de senal) pasa a ser el
 // PISO y el techo se abre al maximo -> el filtro muestra de ese valor a 0 dB.
@@ -1526,13 +1598,13 @@ static void do_action(int c){
     else if(c=='a'&&A.spec.W>0)auto_segment();
     else if(c=='l'&&A.sc0>=0&&A.sc1>A.sc0){ Det d; d.x=A.sc0;d.w=A.sc1-A.sc0;
         if(A.sr0>=0&&A.sr1>=0){d.y=min(A.sr0,A.sr1);d.h=std::abs(A.sr1-A.sr0);}else{d.y=0;d.h=A.spec.H;}
-        d.px={d.x,d.x+d.w,d.x+d.w,d.x};d.py={d.y,d.y,d.y+d.h,d.y+d.h};d.cls=A.clase_activa;A.dets.push_back(d);}
+        d.px={d.x,d.x+d.w,d.x+d.w,d.x};d.py={d.y,d.y,d.y+d.h,d.y+d.h};d.cls=A.clase_activa;A.dets.push_back(d);invalidate_dets_caches();}
     else if(c=='t')A.modo_hilo=!A.modo_hilo;
     else if(c=='b')A.clase_activa=0;                              // bio
     else if(c=='n'&&A.classes.size()>1)A.clase_activa=1;          // antro
-    else if(c=='z'&&A.sel>=0){push_undo();A.dets[A.sel].cls=A.clase_activa;A.dirty=true;}    // asigna la clase activa al seleccionado
-    else if(c=='d'&&A.sel>=0){A.dets.erase(A.dets.begin()+A.sel);A.sel=-1;}
-    else if(c=='c'){push_undo();A.dets.clear();A.hilos.clear();A.sel=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();A.listSel.clear();}
+    else if(c=='z'&&A.sel>=0){push_undo();A.dets[A.sel].cls=A.clase_activa;A.dirty=true;invalidate_dets_caches();}    // asigna la clase activa al seleccionado
+    else if(c=='d'&&A.sel>=0){A.dets.erase(A.dets.begin()+A.sel);A.sel=-1;invalidate_dets_caches();}
+    else if(c=='c'){push_undo();A.dets.clear();A.hilos.clear();A.sel=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();A.listSel.clear();invalidate_dets_caches();}
     else if(c=='s')guardar();
 }
 static void ayuda(){ std::cout<<"\n=== raven.exe ===\n Botones arriba o teclas: o abrir, 1-5 vistas, ESPACIO play sel, p todo, k pausa, . stop,\n"
@@ -1690,7 +1762,7 @@ static void split_free(int idx){ if(idx<0||idx>=(int)A.dets.size()||A.cutX.size(
             else if(pt_in_poly(p2.px,p2.py,(float)cx,(float)cy)){ p2.hx.push_back(d.hx[hh]); p2.hy.push_back(d.hy[hh]); } }
         A.dets.erase(A.dets.begin()+idx);
         A.dets.insert(A.dets.begin()+idx,p2); A.dets.insert(A.dets.begin()+idx,p1);
-        A.sel=idx; return;
+        A.sel=idx; invalidate_dets_caches(); return;
     }
     if((A0.loop==0)!=(B0.loop==0)){
         // ===== EXTERIOR <-> ANILLO: ABRE el anillo (lo une al borde por el trazo; queda 1 pieza sin ese hueco) =====
@@ -1853,7 +1925,7 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                 push_undo(); Det d; d.kind=KIND_BBOX; d.cls=A.clase_activa; d.x=min(c0,c1);d.y=min(r0,r1);
                 d.w=max(1,std::abs(c1-c0));d.h=max(1,std::abs(r1-r0));
                 d.px={d.x,d.x+d.w,d.x+d.w,d.x};d.py={d.y,d.y,d.y+d.h,d.y+d.h};
-                A.dets.push_back(d); A.sel=(int)A.dets.size()-1; }
+                A.dets.push_back(d); A.sel=(int)A.dets.size()-1; invalidate_dets_caches(); }
             else if(click){ if(A.modo_hilo){A.hilos.push_back(track_hilo(c0,r0)); if(!A.hilos.back().col.empty()){A.sc0=A.hilos.back().col.front();A.sc1=A.hilos.back().col.back();A.sr0=A.sr1=-1;}}
                        else { int hit=caja_en(c0,r0); A.cursor_col=c0;                            // clic simple = selecciona el POLIGONO ENTERO bajo el cursor
                               bool inRect=false;                                                    // ¿el clic cae DENTRO del rectangulo de seleccion vigente?
@@ -1932,11 +2004,11 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         if(cmd>=CLS_BASE&&cmd<NEW_BASE){                    // cambiar etiqueta (clase)
             if(selMenu){ push_undo(); int n=set_class_in_selection(cmd-CLS_BASE);   // a TODOS los poligonos de la seleccion (uno o varios)
                 if(n)std::cout<<"Etiqueta cambiada en "<<n<<" poligonos (seleccion)\n"; else A.undo.pop_back(); }
-            else if(bi>=0){ push_undo(); A.dets[bi].cls=cmd-CLS_BASE; A.dirty=true; } }   // un solo poligono
+            else if(bi>=0){ push_undo(); A.dets[bi].cls=cmd-CLS_BASE; A.dirty=true; invalidate_dets_caches(); } }   // un solo poligono
         else if(cmd>=NEW_BASE)crear_caja(cmd-NEW_BASE);
-        else if(cmd==3&&bi>=0){push_undo();A.dets.erase(A.dets.begin()+bi);A.sel=-1;A.dirty=true;}
+        else if(cmd==3&&bi>=0){push_undo();A.dets.erase(A.dets.begin()+bi);A.sel=-1;A.dirty=true;invalidate_dets_caches();}
         else if(cmd==15&&bigHere>=0){ push_undo(); int nh=(int)A.dets[bigHere].hx.size();   // borra el poligono de FONDO mas grande aqui, con TODOS sus anillos
-            A.dets.erase(A.dets.begin()+bigHere); A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.dirty=true;
+            A.dets.erase(A.dets.begin()+bigHere); A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.dirty=true; invalidate_dets_caches();
             std::cout<<"Borrada la etiqueta de fondo (con "<<nh<<" anillos)\n"; }
         else if(cmd==4)play_drag_sel();
         else if(cmd==5){A.sc0=A.sc1=A.sr0=A.sr1=-1;}
@@ -1963,7 +2035,7 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
             if(bestD>=0){ push_undo(); Det&d=A.dets[bestD];
                 if(bestHole>=0){ if((int)d.hx[bestHole].size()<=3){ d.hx.erase(d.hx.begin()+bestHole); d.hy.erase(d.hy.begin()+bestHole); }
                     else { d.hx[bestHole].erase(d.hx[bestHole].begin()+bestK); d.hy[bestHole].erase(d.hy[bestHole].begin()+bestK); } }
-                else if((int)d.px.size()<=3){ A.dets.erase(A.dets.begin()+bestD); A.sel=-1; }
+                else if((int)d.px.size()<=3){ A.dets.erase(A.dets.begin()+bestD); A.sel=-1; invalidate_dets_caches(); }
                 else { d.px.erase(d.px.begin()+bestK); d.py.erase(d.py.begin()+bestK); sync_bbox_from_poly(d); }
                 A.selDet=A.selVert=-1; A.selVertHole=-1; A.dirty=true; std::cout<<"Vertice borrado (clic der)\n"; }
             return 0; }
@@ -2015,7 +2087,7 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                 A.undo.pop_back(); return 0; }                                         // nada marcado -> no borra nada
             push_undo();
             if(A.sel>=0&&A.sel<(int)A.dets.size()){                                    // SELECCION: Supr borra la ETIQUETA seleccionada
-                A.dets.erase(A.dets.begin()+A.sel); A.sel=-1; A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.dirty=true;
+                A.dets.erase(A.dets.begin()+A.sel); A.sel=-1; A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.dirty=true; invalidate_dets_caches();
                 std::cout<<"Etiqueta borrada\n"; return 0; }
             int n=delete_in_selection(); if(n)std::cout<<"Borradas "<<n<<" etiquetas (seleccion)\n"; else A.undo.pop_back(); return 0; }  // sin etiqueta sel.: borra por rectangulo de seleccion (o descarta el snapshot)
         if(wp==VK_ESCAPE){   // Esc: cancela el modo activo; NUNCA cierra la ventana (se sale con 'q')

@@ -43,8 +43,7 @@ static const char* CLS_NAME = "EtiquetadorEspectro";
 
 static void recompute_enhanced() {
     Img base = enhance_asinh(A.spec, 0.07);
-    A.enhanced = A.usar_gate ? base : base;  // (gate opcional; asinh fiel por defecto)
-    // Nota: el gate por banda se puede reactivar aqui si se desea.
+    A.enhanced = base;  // asinh fiel por defecto
 }
 
 static void rebuild_dib() {

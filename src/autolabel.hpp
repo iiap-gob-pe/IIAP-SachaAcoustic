@@ -1,6 +1,7 @@
 // autolabel.hpp - Autoetiquetado por vision clasica SIN OpenCV.
 // Umbral por banda (mediana+K*MAD) -> morfologia -> componentes conexos ->
 // bounding box + poligono (trazado de contorno de Moore).
+// Optimizacion: dilate_into/erode_into in-place + ping-pong en auto_label.
 #pragma once
 #include <vector>
 #include <algorithm>
@@ -12,6 +13,7 @@ enum { CLASE_BIO = 0, CLASE_ANTRO = 1 };
 
 using Mask = std::vector<uint8_t>;
 
+// Version original (retorna copia) — se mantiene para compatibilidad.
 inline Mask dilate(const Mask& m, int W, int H, int kw, int kh) {
     Mask o(m.size(), 0);
     int rx = kw / 2, ry = kh / 2;
@@ -27,6 +29,22 @@ inline Mask dilate(const Mask& m, int W, int H, int kw, int kh) {
     return o;
 }
 
+// Version in-place: escribe resultado en dst (debe tener m.size() elementos).
+inline void dilate_into(const Mask& m, Mask& dst, int W, int H, int kw, int kh) {
+    std::fill(dst.begin(), dst.end(), 0);
+    int rx = kw / 2, ry = kh / 2;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            if (!m[y * W + x]) continue;
+            for (int dy = -ry; dy <= ry; ++dy)
+                for (int dx = -rx; dx <= rx; ++dx) {
+                    int ny = y + dy, nx = x + dx;
+                    if (ny >= 0 && ny < H && nx >= 0 && nx < W) dst[ny * W + nx] = 1;
+                }
+        }
+}
+
+// Version original (retorna copia).
 inline Mask erode(const Mask& m, int W, int H, int kw, int kh) {
     Mask o(m.size(), 1);
     int rx = kw / 2, ry = kh / 2;
@@ -36,12 +54,29 @@ inline Mask erode(const Mask& m, int W, int H, int kw, int kh) {
             for (int dy = -ry; dy <= ry && all; ++dy)
                 for (int dx = -rx; dx <= rx; ++dx) {
                     int ny = y + dy, nx = x + dx;
-                    if (ny < 0 || ny >= H || nx < 0 || nx >= W) continue;  // fuera de imagen = PRESENTE -> no erosiona el borde (la señal que llega al borde se conserva)
+                    if (ny < 0 || ny >= H || nx < 0 || nx >= W) continue;
                     if (!m[ny * W + nx]) { all = false; break; }
                 }
             o[y * W + x] = all ? 1 : 0;
         }
     return o;
+}
+
+// Version in-place: escribe resultado en dst.
+inline void erode_into(const Mask& m, Mask& dst, int W, int H, int kw, int kh) {
+    std::fill(dst.begin(), dst.end(), 1);
+    int rx = kw / 2, ry = kh / 2;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            bool all = true;
+            for (int dy = -ry; dy <= ry && all; ++dy)
+                for (int dx = -rx; dx <= rx; ++dx) {
+                    int ny = y + dy, nx = x + dx;
+                    if (ny < 0 || ny >= H || nx < 0 || nx >= W) continue;
+                    if (!m[ny * W + nx]) { all = false; break; }
+                }
+            dst[y * W + x] = all ? 1 : 0;
+        }
 }
 
 // Trazado de contorno de Moore (8-vec) sobre los pixeles con label objetivo.
@@ -136,25 +171,30 @@ inline std::vector<Det> auto_label(const Img& e_in, float K = 4.5f, int area_min
         for (int x = 0; x < W; ++x)
             if (row[x] - med > K * mad) mask[y * W + x] = 1;
     }
-    // Umbral GLOBAL adicional: las BANDAS GRAVES ESTACIONARIAS llenan toda la fila,
-    // asi que su mediana por-fila es alta y el test por-fila NO las marca. Con un
-    // umbral global (mediana+K*MAD de toda la imagen) capturamos esas bandas fuertes.
+    // Umbral GLOBAL: reutiliza tmp en vez de copiar toda la imagen.
     {
-        size_t N = (size_t)W * H; std::vector<float> all(e.d);
-        std::nth_element(all.begin(), all.begin() + N / 2, all.end());
-        float gmed = all[N / 2];
-        for (size_t i = 0; i < N; ++i) all[i] = std::fabs(e.d[i] - gmed);
-        std::nth_element(all.begin(), all.begin() + N / 2, all.end());
-        float gmad = all[N / 2] * 1.4826f + 1e-6f;
+        size_t N = (size_t)W * H;
+        tmp.resize(N);
+        for (size_t i = 0; i < N; ++i) tmp[i] = e.d[i];
+        std::nth_element(tmp.begin(), tmp.begin() + N / 2, tmp.end());
+        float gmed = tmp[N / 2];
+        for (size_t i = 0; i < N; ++i) tmp[i] = std::fabs(e.d[i] - gmed);
+        std::nth_element(tmp.begin(), tmp.begin() + N / 2, tmp.end());
+        float gmad = tmp[N / 2] * 1.4826f + 1e-6f;
         float gthr = gmed + K * gmad;
         for (size_t i = 0; i < N; ++i) if (e.d[i] > gthr) mask[i] = 1;
     }
     // open (3x3) quita motas; close (9x3) une el mismo canto
-    mask = dilate(erode(mask, W, H, 3, 3), W, H, 3, 3);
-    mask = erode(dilate(mask, W, H, 9, 3), W, H, 9, 3);
+    // Ping-pong: buf_a y buf_b se reutilizan para evitar allocs temporales.
+    Mask buf_a((size_t)W * H), buf_b((size_t)W * H);
+    erode_into(mask, buf_a, W, H, 3, 3);       // erode -> buf_a
+    dilate_into(buf_a, buf_b, W, H, 3, 3);     // dilate(buf_a) -> buf_b (open)
+    erode_into(buf_b, buf_a, W, H, 9, 3);      // erode(buf_b) -> buf_a
+    dilate_into(buf_a, mask, W, H, 9, 3);      // dilate(buf_a) -> mask (close)
     if (buffer > 0) {                     // BUFFER: une detecciones cercanas + margen
         int k = 2 * buffer + 1;
-        mask = dilate(mask, W, H, k, k);  // (sin erosionar -> deja el margen "buffer")
+        dilate_into(mask, buf_a, W, H, k, k);  // (sin erosionar -> deja el margen "buffer")
+        mask = buf_a;
     }
     int dec = std::max(3, 3 + buffer * 2);// decimado del contorno (mas grueso con buffer)
 

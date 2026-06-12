@@ -1,5 +1,6 @@
 // spectrogram.hpp - STFT -> espectrograma dB normalizado [0,1] (sin OpenCV).
 // Img resultante: fila 0 = freq ALTA, ultima fila = freq BAJA (vista estandar).
+// Optimizacion: usa vector plano db_vals en vez de imagen intermedia S.
 #pragma once
 #include <vector>
 #include <stdexcept>
@@ -24,28 +25,30 @@ inline Img compute_spectrogram(const AudioData& a, const SpecParams& P) {
     for (int i = 0; i < nfft; ++i)
         win[i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / (nfft - 1)));
 
-    // S[bin][frame] en dB (bin 0 = freq baja)
-    Img S(nframes, nbins);
+    // Vector plano para dB: S[frame * nbins + bin] en dB (bin 0 = freq baja)
+    std::vector<float> db_vals((size_t)nframes * nbins);
     std::vector<Cf> buf(nfft);
     float mx = -1e30f;
     for (int t = 0; t < nframes; ++t) {
         const int off = t * hop;
         for (int i = 0; i < nfft; ++i) buf[i] = Cf(x[off + i] * win[i], 0.0f);
         fft(buf);
+        size_t row = (size_t)t * nbins;
         for (int b = 0; b < nbins; ++b) {
             float re = buf[b].real(), im = buf[b].imag();
             float db = 10.0f * std::log10(re * re + im * im + 1e-12f);
-            S.at(b, t) = db;
+            db_vals[row + b] = db;
             if (db > mx) mx = db;
         }
     }
-    // normalizar a [0,1] con rango dinamico fijo y voltear (freq baja abajo)
+    // Normalizar a [0,1] con rango dinamico fijo y voltear (freq baja abajo) en UN solo pase
     float lo = mx - (float)P.dyn_range_db;
+    float inv_range = 1.0f / (mx - lo + 1e-9f);
     Img out(nframes, nbins);
     for (int b = 0; b < nbins; ++b) {
         int yr = nbins - 1 - b;  // voltear vertical
         for (int t = 0; t < nframes; ++t) {
-            float v = (S.at(b, t) - lo) / (mx - lo + 1e-9f);
+            float v = (db_vals[(size_t)t * nbins + b] - lo) * inv_range;
             v = v < 0 ? 0 : (v > 1 ? 1 : v);
             out.at(yr, t) = v;
         }
