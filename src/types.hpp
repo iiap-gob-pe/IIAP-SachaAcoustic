@@ -32,6 +32,7 @@ struct Det {
     std::vector<std::vector<int>> hx, hy; // HUECOS/anillos: cada par hx[i]/hy[i] es el contorno de un hueco (area que NO es la clase)
     int cls = 0;                          // indice en la tabla de clases (0=bio, 1=antro por defecto)
     int kind = KIND_BBOX;                 // KIND_BBOX o KIND_POLY
+    int orig_area = 0;                    // area original (se guarda en el primer Ctrl++)
 };
 
 // Clase/etiqueta dinamica: nombre + color RGB de dibujo.
