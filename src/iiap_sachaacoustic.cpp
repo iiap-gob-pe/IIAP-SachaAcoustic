@@ -36,7 +36,7 @@ struct Boton { int x, y, w, h; std::string label; int key; int icon; std::string
 
 // Herramientas de etiquetado (A.tool)
 // Herramientas: seleccionar, etiquetar bounding-box, etiquetar poligono, editar, cortar
-enum { T_SELECT = 0, T_BBOX = 1, T_POLY = 2, T_EDIT = 3, T_CUT = 4, T_MERGE = 5 };
+enum { T_SELECT = 0, T_BBOX = 1, T_POLY = 2, T_EDIT = 3, T_CUT = 4, T_MERGE = 5, T_ERASER = 6 };
 
 struct AppS {
     AudioData audio; int sr = 0;
@@ -92,6 +92,14 @@ struct AppS {
     bool listSelDirty = true;            // reconstruir cuando cambia listSel
     unsigned long long genCounter = 0;   // generation counter para build_rios
     std::vector<unsigned long long> usedGen;  // vector de generaciones para evitar allocs
+
+    // --- borrador temporal (mascara por filtro) ---
+    std::vector<uint8_t> eraserMask;     // mascara W*H: 0=normal, 1=borrado
+    int eraserRadius = 5;                // radio del pincel (ajustable con rueda)
+    bool eraserDragging = false;         // clic izq presionado dibujando
+    int eraserPrevC = -1, eraserPrevR = -1;  // ultimo pixel de spec dibujado
+    float prevDbMin = 0.f, prevDbMax = 1.f;  // para detectar cambios de filtro
+    float prevFLo = 0.f, prevFHi = 1.f;
 
     // seleccion en coords de espectro (tiempo c, frecuencia r)
     int sc0 = -1, sc1 = -1, sr0 = -1, sr1 = -1;
@@ -242,6 +250,45 @@ static void colorf(float v, float& r, float& g, float& b) {
 static size_t next_pow2(size_t n){ size_t p=1; while(p<n) p<<=1; return p; }
 // filtro: pasa si freq-fraccion en [fLo,fHi] y energia >= dbMin
 static bool pass_filt(float f,float e){ return f>=A.fLo && f<=A.fHi && e>=A.dbMin && e<=A.dbMax; }
+static void upload_texture();   // forward declaration (def. mas abajo)
+
+// ---- borrador temporal ----
+static void eraser_init(){
+    int W=A.spec.W, H=A.spec.H;
+    A.eraserMask.assign((size_t)W*H, 0);
+    A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+}
+static void eraser_paint(int c, int r){
+    int W=A.spec.W, H=A.spec.H;
+    if(W<1||H<1||A.eraserMask.empty()) return;
+    int rad=A.eraserRadius;
+    for(int dr=-rad;dr<=rad;++dr){
+        for(int dc=-rad;dc<=rad;++dc){
+            if(dc*dc+dr*dr>rad*rad) continue;
+            int rr=r+dr, cc=c+dc;
+            if(rr>=0&&rr<H&&cc>=0&&cc<W) A.eraserMask[(size_t)rr*W+cc]=1;
+        }
+    }
+}
+static void eraser_line(int c0,int r0,int c1,int r1){
+    int dx=std::abs(c1-c0), sx=c0<c1?1:-1;
+    int dy=-std::abs(r1-r0), sy=r0<r1?1:-1;
+    int err=dx+dy;
+    for(;;){
+        eraser_paint(c0,r0);
+        if(c0==c1&&r0==r1) break;
+        int e2=2*err;
+        if(e2>=dy){err+=dy;c0+=sx;}
+        if(e2<=dx){err+=dx;r0+=sy;}
+    }
+}
+static void eraser_reset_if_filter_changed(){
+    if(A.dbMin!=A.prevDbMin||A.dbMax!=A.prevDbMax||A.fLo!=A.prevFLo||A.fHi!=A.prevFHi){
+        std::fill(A.eraserMask.begin(),A.eraserMask.end(),0);
+        A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+        upload_texture();   // re-subir textura SIN la mascara
+    }
+}
 
 // ---- clases dinamicas ----
 static void class_color(int c, float& r, float& g, float& b){
@@ -312,9 +359,11 @@ static void build_env(){ A.envMin.assign(A.NB,0); A.envMax.assign(A.NB,0);
 
 // ---------------- carga ----------
 static void upload_texture(){ int W=A.enh.W,H=A.enh.H; RGBImg c(W,H);
+    bool hasMask=!A.eraserMask.empty();
     for(int r=0;r<H;++r){ float f=(float)(H-1-r)/(H-1);
         for(int x=0;x<W;++x){ float e=A.enh.at(r,x); size_t i=((size_t)r*W+x)*3;
-            if(pass_filt(f,e)){ int k=(int)(min(1.f,max(0.f,e))*255+0.5f);
+            if(pass_filt(f,e) && (!hasMask||A.eraserMask[r*W+x]==0)){
+                int k=(int)(min(1.f,max(0.f,e))*255+0.5f);
                 c.d[i]=A.cmapLUT[k][0];c.d[i+1]=A.cmapLUT[k][1];c.d[i+2]=A.cmapLUT[k][2]; }
             else { c.d[i]=c.d[i+1]=c.d[i+2]=0; } } }
     if(!A.tex)glGenTextures(1,&A.tex);
@@ -364,6 +413,7 @@ static bool load_audio(const std::string& path){ try{
     A.fLo=0.f; A.fHi=1.f; A.dbMin=0.f; A.dbMax=1.f;            // filtros GLOBALES (freq + dB) a default
     A.volFLo=0.f; A.volFHi=1.f; A.volDbMin=0.f; A.volDbMax=1.f; // filtros LOCALES de la vista Volumen a default
     A.gain=1.0f; A.view=1; layout_botones();                   // ganancia normal + vista Espectro 2D + relayout de botones
+    eraser_init();                                              // inicializar mascara del borrador
     double dur=A.sr?(double)A.audio.samples.size()/A.sr:0;     // eje X segun duracion
     A.tlen=(float)max(2.5,min(14.0,dur*0.7)); A.crosslen=1.7f;  // tiempo largo, freq/dB mas grandes
     A.ax[0]=A.tlen; A.ax[1]=A.ax[2]=A.crosslen;                 // escalas iniciales del cubo (editables con manijas)
@@ -411,7 +461,7 @@ static void set_resolution(int dir){
     A.cursor_col=(int)(A.cursor_col*rx+0.5);
     A.vc0=max(0,min(newW-1,(int)(A.vc0*rx+0.5))); A.vc1=max(A.vc0+1,min(newW,(int)(A.vc1*rx+0.5)));   // REESCALA la ventana de tiempo por rx (CONSERVA la region visible; NO resetea)
     A.vr0=max(0,min(A.spec.H-1,A.vr0)); A.vr1=max(A.vr0+1,min(A.spec.H,A.vr1>0?A.vr1:A.spec.H));      // freq (vr): H sin cambio -> se conserva el zoom de frecuencia (clamp defensivo)
-    build_rios(); build_picos(); upload_texture(); A.dirty=true;
+    build_rios(); build_picos(); eraser_init(); upload_texture(); A.dirty=true;
     std::cout<<"Resolucion: hop="<<newHop<<" -> "<<newW<<" columnas (res3d="<<A.res3d<<")\n"; }
 static bool open_dialog(){
     if(g_dialogOpen){ if(g_hwnd)SetForegroundWindow(g_hwnd); return false; }   // ya hay un dialogo abierto -> traer al frente, NO abrir otro
@@ -558,6 +608,7 @@ static void layout_botones(){
         {"Poly",'P',-1,0,"Etiquetar POLIGONO (clic a clic; clic-der/Enter cierra)"},
         {"Cortar",'X',-1,0,"Corte LIBRE: pinta el trazo y clic-derecho corta TODAS las etiquetas que cruza"},
         {"Unir",'J',-1,0,"Unir dos etiquetas: clic en la primera, luego en la segunda"},
+        {"Borrar",'d',-1,0,"Borrar residuos: pinta areas para excluir del autoetiquetado (radio adjustable con rueda)"},
         {"Auto",'a',-1,0,"Auto-etiquetar SOBRE EL FILTRO, con la forma activa (poligono o bbox)"},
         {"+Etiq",'N',-1,0,"Crear etiqueta nueva (escribe el nombre)"},
         {"Ocultar",'O',-1,0,"Ocultar / mostrar las etiquetas"},
@@ -619,8 +670,10 @@ static void show_busy(const std::string& msg){ if(!g_hdc)return;
     SwapBuffers(g_hdc); }
 // espectro restringido al filtro actual (freq+dB): para auto-segmentar SOLO lo visible
 static Img filtered_spec(){ Img s=A.spec; int W=A.spec.W,H=A.spec.H;
+    bool hasMask=!A.eraserMask.empty();
     for(int r=0;r<H;++r){ float f=(float)(H-1-r)/(H-1);
-        for(int c=0;c<W;++c){ float e=A.enh.at(r,c); if(!pass_filt(f,e)) s.at(r,c)=0.f; } }
+        for(int c=0;c<W;++c){ float e=A.enh.at(r,c);
+            if(!pass_filt(f,e)||(hasMask&&A.eraserMask[r*W+c])) s.at(r,c)=0.f; } }
     return s; }
 // Auto-etiquetar: detecta sobre el espectro FILTRADO; si el filtro deja todo vacio,
 // reintenta sobre el espectro completo para que SIEMPRE proponga algo. Muestra etiquetas.
@@ -1082,7 +1135,8 @@ static void render_toolbar(){ ortho2d();
         if(b.key=='G'&&A.quiver_completo)on=true;
         if(b.key=='S'&&A.tool==T_SELECT)on=true;
         if(b.key=='Y'&&A.tool==T_BBOX)on=true; if(b.key=='P'&&A.tool==T_POLY)on=true;
-        if(b.key=='X'&&A.tool==T_CUT)on=true; if(b.key=='J'&&A.tool==T_MERGE)on=true; if(b.key=='O'&&A.hide_labels)on=true; if(b.key=='L'&&A.listOpen)on=true;
+        if(b.key=='X'&&A.tool==T_CUT)on=true; if(b.key=='J'&&A.tool==T_MERGE)on=true; if(b.key=='d'&&A.tool==T_ERASER)on=true;
+        if(b.key=='O'&&A.hide_labels)on=true; if(b.key=='L'&&A.listOpen)on=true;
         if(on)glColor3f(0.25f,0.45f,0.65f);else glColor3f(0.20f,0.20f,0.24f);
         glBegin(GL_QUADS);glVertex2f(b.x,b.y);glVertex2f(b.x+b.w,b.y);glVertex2f(b.x+b.w,b.y+b.h);glVertex2f(b.x,b.y+b.h);glEnd();
         glColor3f(0.5f,0.5f,0.55f);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(b.x,b.y);glVertex2f(b.x+b.w,b.y);glVertex2f(b.x+b.w,b.y+b.h);glVertex2f(b.x,b.y+b.h);glEnd();
@@ -1102,10 +1156,11 @@ static void render_toolbar(){ ortho2d();
 static void render_hud(){ ortho2d(); glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
     glColor4f(0,0,0,0.6f);glBegin(GL_QUADS);glVertex2f(0,0);glVertex2f(A.cW,0);glVertex2f(A.cW,HUD_H);glVertex2f(0,HUD_H);glEnd();glDisable(GL_BLEND);
     const char* vn[]={"","Espectro2D","Terreno3D","RioEspectral","NubePuntos","CascadaEspectral","Quiver3D","Volumen"};
-    const char* tn[]={"Selec","BBox","Poligono","Editar","Cortar","Unir"};
+    const char* tn[]={"Selec","BBox","Poligono","Editar","Cortar","Unir","Borrador"};
     std::string s=std::string("IIAP SachaAcoustic | ")+A.fname+" | V"+std::to_string(A.view)+":"+vn[A.view]+
         "  etiq="+std::to_string(A.dets.size())+"  clase="+class_name(A.clase_activa)+"  tool="+tn[A.tool]+
         (A.tool==T_POLY?"(a mano)":"")+
+        (A.tool==T_ERASER?std::string(" r=")+std::to_string(A.eraserRadius):"")+
         "  play="+(A.solo_banda?"banda(t+f)":"toda-freq(t)")+(PLAYER.paused?"  [PAUSA]":"");
     { char vb[24]; snprintf(vb,24,"  vel=%.1fx",A.playSpeed); s+=vb; }   // velocidad de reproduccion
     if(A.view>=2){const int*p=PERM[A.axperm];s+=std::string("  ejes X=")+DIMN[p[0]]+" Y="+DIMN[p[1]]+" Z="+DIMN[p[2]]+"  res3d="+std::to_string(A.res3d);}
@@ -1414,7 +1469,14 @@ static void render(){ glClearColor(0.04f,0.03f,0.06f,1); glViewport(0,0,A.cW,A.c
             render_axes2d();                                                // ejes 2D (solo vista 2D)
             if(A.dragging&&A.dragRegion==1){glColor3f(1,1,1);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(A.dx0,A.dy0);glVertex2f(A.dx1,A.dy0);glVertex2f(A.dx1,A.dy1);glVertex2f(A.dx0,A.dy1);glEnd();}
             if(A.tool==T_CUT&&A.cutX.size()>=1){ glColor3f(1,0.35f,0.35f);glLineWidth(2.5f);  // trazo de corte libre
-                glBegin(GL_LINE_STRIP);for(size_t k=0;k<A.cutX.size();++k){float sx,sy;spec_to_main((float)A.cutX[k],(float)A.cutY[k],sx,sy);glVertex2f(sx,sy);}glEnd(); } }
+                glBegin(GL_LINE_STRIP);for(size_t k=0;k<A.cutX.size();++k){float sx,sy;spec_to_main((float)A.cutX[k],(float)A.cutY[k],sx,sy);glVertex2f(sx,sy);}glEnd(); }
+            if(A.tool==T_ERASER){ int c,r; main_to_spec(A.mx,A.my,c,r); float sx,sy; spec_to_main((float)c,(float)r,sx,sy);   // cursor circular del borrador
+                float spanX=max(1.f,(plotX1()-plotX0())/(float)max(1,vhi()-vlo()));
+                float spanY=max(1.f,(plotY1()-plotY0())/(float)max(1,rhi()-rlo()));
+                float rx=(float)A.eraserRadius*spanX, ry=(float)A.eraserRadius*spanY;
+                glLineWidth(2.f); glColor4f(1.f,0.3f,0.3f,0.7f); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+                int segs=32; glBegin(GL_LINE_LOOP); for(int i=0;i<segs;++i){ float a=6.2832f*i/segs; glVertex2f(sx+cosf(a)*rx,sy+sinf(a)*ry); } glEnd();
+                glDisable(GL_BLEND); glLineWidth(1.f); } }
         else if(A.view==2) render_terrain3d();
         else if(A.view==3) render_rios3d();
         else if(A.view==4) render_pointcloud();
@@ -1629,7 +1691,8 @@ static void crear_caja(int cls){ if(A.sc0<0||A.sc1<=A.sc0)return; push_undo(); D
 // sonido se vuelve ruido; al pulsar, ese techo (umbral de senal) pasa a ser el
 // PISO y el techo se abre al maximo -> el filtro muestra de ese valor a 0 dB.
 static void set_signal_value(){ if(A.spec.W<1)return; float thr=A.dbMax;
-    A.dbMin=max(0.f,min(0.98f,thr)); A.dbMax=1.0f; upload_texture(); A.refilterPending=true;
+    A.dbMin=max(0.f,min(0.98f,thr)); A.dbMax=1.0f; upload_texture(); eraser_reset_if_filter_changed();
+    A.refilterPending=true;
     std::cout<<"Valor de senal fijado: piso dB="<<(A.dbMin-1)*A.P.dyn_range_db<<" dB\n"; }
 
 // zoom 2D: reescala las ventanas de tiempo (vc) y frecuencia (vr) por 'factor',
@@ -1654,6 +1717,7 @@ static void do_action(int c){
     else if(c=='E'){A.tool=T_EDIT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}   // editar forma
     else if(c=='X'){A.tool=T_CUT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}    // corte libre
     else if(c=='J'){A.tool=T_MERGE;A.mergeFirst=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}  // unir etiquetas
+    else if(c=='d'){A.tool=T_ERASER;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}   // borrador
     else if(c=='N'){ A.naming=true; A.nameBuf.clear(); }  // crear etiqueta (captura de texto)
     else if(c=='R')cargar_raven();                    // cargar Raven
     else if(c=='H')A.rio_completo=!A.rio_completo;   // rio: hilos completos vs corte por vertice
@@ -1677,7 +1741,7 @@ static void do_action(int c){
         else if(c=='g')A.dbMin=max(0.f,A.dbMin-sd);           // piso dB -
         else if(c=='w')A.dbMax=min(1.f,A.dbMax+sd);           // techo dB +
         else if(c=='e')A.dbMax=max(A.dbMin+sd,A.dbMax-sd);    // techo dB -
-        upload_texture(); A.refilterPending=true; }           // re-filtra el sonido en vivo
+        upload_texture(); eraser_reset_if_filter_changed(); A.refilterPending=true; }           // re-filtra el sonido en vivo
     else if(c=='o')open_dialog();
     else if(c==' '){ if(PLAYER.playing&&PLAYER.cur_sample()>=0)PLAYER.pause_toggle(); else play_window(); }  // espacio = play/pausa
     else if(c=='p')play_filtered(0,A.spec.W,false,0,1);   // todo, con filtros aplicados
@@ -1692,12 +1756,11 @@ static void do_action(int c){
     else if(c=='b')A.clase_activa=0;                              // bio
     else if(c=='n'&&A.classes.size()>1)A.clase_activa=1;          // antro
     else if(c=='z'&&A.sel>=0){push_undo();A.dets[A.sel].cls=A.clase_activa;A.dirty=true;invalidate_dets_caches();}    // asigna la clase activa al seleccionado
-    else if(c=='d'&&A.sel>=0){A.dets.erase(A.dets.begin()+A.sel);A.sel=-1;invalidate_dets_caches();}
     else if(c=='c'){push_undo();A.dets.clear();A.hilos.clear();A.sel=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();A.listSel.clear();invalidate_dets_caches();}
     else if(c=='s')guardar();
 }
 static void ayuda(){ std::cout<<"\n=== raven.exe ===\n Botones arriba o teclas: o abrir, 1-5 vistas, ESPACIO play sel, p todo, k pausa, . stop,\n"
-    " a auto, l caja, t hilo, b/n clase, z/x set sel, d borra, c limpia, s guarda, r ejes(3D), q salir.\n"
+    " a auto, l caja, t hilo, b/n clase, z asig cl, d borrador, Supr borra, c limpia, s guarda, r ejes(3D), q salir.\n"
     " Etiqueta arrastrando en la vista 2D o en la tira inferior (sirve en 3D). Arrastrar selecciona\n"
     " tiempo+frecuencia; ESPACIO reproduce SOLO esa banda. Clic simple = mover playhead (seek).\n"; }
 
@@ -1735,6 +1798,7 @@ static void fbar_drag(int code,int my){ Bar bf=bar_freq(),bd=bar_db(),bg=bar_gai
     else if(code==11)flt_dbMax()=max(flt_dbMin()+0.002f,bar_v(bd,my));
     flt_fLo()=max(0.f,flt_fLo());flt_fHi()=min(1.f,flt_fHi());flt_dbMin()=max(0.f,flt_dbMin());flt_dbMax()=min(1.f,flt_dbMax());
     if(A.view!=7) upload_texture();              // V7: filtro local, no reconstruye la textura 2D
+    eraser_reset_if_filter_changed();
     if(code>=8&&code<=11)A.refilterPending=true; }  // dB/freq cambiaron -> re-filtrar el sonido en vivo (incl. V7)
 
 // posicion en pantalla (vista 2D) de una coord de espectro (col,row)
@@ -2196,6 +2260,8 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                     if(A.sel<0) A.sel=caja_en(c,r);               // si no habia ninguno seleccionado, selecciona uno para empezar a editar; si ya habia, NO cambia (Editar solo trabaja sobre el seleccionado; Esc o Selec para cambiar)
                     A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.editVert=-1; A.editHole=-1; A.dragging=false;A.dragRegion=0; } }
             else if(A.tool==T_CUT){ A.dragRegion=7; A.cutX.push_back(c); A.cutY.push_back(r); }  // pinta el trazo de corte
+            else if(A.tool==T_ERASER){ A.eraserDragging=true; A.eraserPrevC=c; A.eraserPrevR=r;
+                eraser_paint(c,r); upload_texture(); A.dragRegion=7; }  // borrador: pinta y arrastra
             else if(A.tool==T_MERGE){  // UNIR: clic en una etiqueta para seleccionarla/combina
                 int hit=caja_en(c,r);
                 if(hit>=0){
@@ -2238,7 +2304,9 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
             A.ax[A.scaleAxis]=max(0.4f,min(14.f,A.ax[A.scaleAxis]+(float)proj*0.012f)); }
         else if(A.dragRegion==30){ scroll_center(mx); }                           // barra de scroll horizontal: mueve la ventana
         else if(A.dragRegion==22){ buffer_apply(mx); }                            // modal de buffer
-        else if(A.dragRegion==7){ int c,r; main_to_spec(mx,my,c,r); if(A.cutX.empty()||A.cutX.back()!=c||A.cutY.back()!=r){A.cutX.push_back(c);A.cutY.push_back(r);} }  // pinta trazo de corte
+        else if(A.dragRegion==7){ int c,r; main_to_spec(mx,my,c,r);
+            if(A.tool==T_ERASER){ if(A.eraserDragging){ eraser_line(A.eraserPrevC,A.eraserPrevR,c,r); A.eraserPrevC=c; A.eraserPrevR=r; upload_texture(); } }
+            else if(A.cutX.empty()||A.cutX.back()!=c||A.cutY.back()!=r){A.cutX.push_back(c);A.cutY.push_back(r);} }  // pinta trazo de corte
         else if(A.dragRegion>=8&&A.dragRegion<=12){ fbar_drag(A.dragRegion,my); }   // barras de filtro / ganancia
         else if(A.dragRegion==21&&A.sel>=0&&A.sel<(int)A.dets.size()){ int c,r; main_to_spec(mx,my,c,r); Det&d=A.dets[A.sel];  // editar forma
             if(d.kind==KIND_POLY&&d.px.size()>=3){                     // POLIGONO: NO rectangularizar
@@ -2275,7 +2343,7 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                         d.px.insert(d.px.begin()+A.pendEdge+1,A.pendEdgeC); d.py.insert(d.py.begin()+A.pendEdge+1,A.pendEdgeR);
                         sync_bbox_from_poly(d); A.dirty=true; A.selDet=A.sel; A.selVert=A.pendEdge+1; A.selVertHole=-1; A.selVerts.clear(); } } }
             A.pendEdge=-1; A.pendEdgeHole=-1; return 0; }
-        if(A.dragRegion==7){ A.dragRegion=0; return 0; }   // corte libre: se sigue pintando; clic-der ejecuta
+        if(A.dragRegion==7){ A.dragRegion=0; A.eraserDragging=false; return 0; }   // corte libre / borrador: se sigue pintando
         if(A.dragRegion==1||A.dragRegion==2){ int c0,r0,c1,r1;                 // SELECCION (etiquetar)
             if(A.dragRegion==1){main_to_spec(A.dx0,A.dy0,c0,r0);main_to_spec(mx,my,c1,r1);}
             else{strip_to_spec(A.dx0,A.dy0,c0,r0);strip_to_spec(mx,my,c1,r1);}
@@ -2416,6 +2484,8 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         if(A.listOpen){ float lx,ly,lw,lh; list_rect(lx,ly,lw,lh);   // rueda sobre la LISTA = scroll de la lista
             if(pt.x>=lx&&pt.x<=lx+lw&&pt.y>=ly&&pt.y<=ly+lh){ A.listScroll+=(dz>0?-3:3); if(A.listScroll<0)A.listScroll=0; return 0; } }
         if(A.spec.W>0 && pt.y>=panel_y0()){ scroll_pan(dz>0?-1:1); return 0; }   // rueda sobre el AREA INFERIOR (tira+oscilograma+scroll, donde se ve la ventana) = mueve la ventana de tiempo
+        if(A.tool==T_ERASER&&A.view==1&&A.spec.W>0 && pt.x>=plotX0()-2&&pt.x<=plotX1()+2&&pt.y>=plotY0()-2&&pt.y<=plotY1()+2){   // rueda sobre espectrograma con borrador = ajustar radio
+            A.eraserRadius=max(1,min(50,A.eraserRadius+(dz>0?1:-1))); return 0; }
         if(A.view==1&&A.spec.W>0 && pt.x>=plotX0()-2&&pt.x<=plotX1()+2&&pt.y>=plotY0()-2&&pt.y<=plotY1()+2){   // rueda sobre el espectrograma 2D = ZOOM hacia el cursor
             int c,r; main_to_spec(pt.x,pt.y,c,r); zoom2d(dz>0?0.8f:1.25f,c,r); return 0; }
         A.dist*=(dz>0)?0.9f:1.1f; A.dist=max(0.5f,min(20.f,A.dist)); return 0; }
@@ -2500,7 +2570,7 @@ int main(int argc,char**argv){
     DragAcceptFiles(hwnd,TRUE);   // habilita ARRASTRAR Y SOLTAR un WAV sobre la ventana (WM_DROPFILES)
     if(argc>=2) load_audio(argv[1]);
     if(argc>=4){ A.yaw=(float)atof(argv[3]); A.view=2; layout_botones(); }   // (preview) yaw inicial + vista 3D
-    if(argc>=5){ A.dbMin=(float)atof(argv[4]); upload_texture(); }            // (preview) piso dB para ralear la superficie
+    if(argc>=5){ A.dbMin=(float)atof(argv[4]); upload_texture(); eraser_reset_if_filter_changed(); }  // (preview) piso dB para ralear la superficie
     if(argc>=6){ A.pitch=(float)atof(argv[5]); }                              // (preview) pitch inicial
     MSG msg; bool run=true;
     int rfc=0;
