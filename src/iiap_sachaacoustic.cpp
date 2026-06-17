@@ -327,10 +327,21 @@ static int rhi(){ int H=A.spec.H; int b=(A.vr1>A.vr0)?A.vr1:H; b=min(H,b); if(H<
 
 // ---------------- analisis: crestas, picos, hilos, oscilograma ----------
 static void build_rios() {
-    A.rios.clear(); const Img& e = A.enh; int W=e.W,H=e.H; float thr=0.35f;
+    A.rios.clear(); const Img& e = A.enh; int W=e.W,H=e.H;
+    if(W<2||H<2){ std::cout<<"build_rios: espectrograma demasiado pequeno ("<<W<<"x"<<H<<")\n"; return; }
+    // Umbral adaptativo: percentil p20 del espectrograma mejorado (robusto al nivel del audio)
+    std::vector<float> vals; vals.reserve((size_t)W*H/4);
+    for(int c=0;c<W;c+=2) for(int r=1;r<H-1;r+=2) vals.push_back(e.at(r,c));
+    float thr=0.35f;  // default por si no hay datos
+    if(vals.size()>=8){
+        size_t idx=vals.size()/5;  // p20
+        std::nth_element(vals.begin(),vals.begin()+idx,vals.end());
+        float p20=vals[idx];
+        thr=max(0.08f, min(0.50f, p20*1.2f));  // 1.2x el p20, acotado en [0.08, 0.50]
+    }
     std::vector<Hilo> act;
-    ++A.genCounter;  // generation counter: evita limpiar el vector used en cada columna
     for (int c=0;c<W;++c){
+        ++A.genCounter;  // generation counter POR COLUMNA: evita que un hilo absorba 2 picos en la misma col
         std::vector<int> pk;
         for(int r=1;r<H-1;++r){ float v=e.at(r,c); if(v>thr&&v>=e.at(r-1,c)&&v>=e.at(r+1,c)) pk.push_back(r);}
         // Generation counter en vez de vector<bool> used: misma logica, cero allocs
@@ -338,10 +349,12 @@ static void build_rios() {
             if(best>=0){act[best].col.push_back(c);act[best].row.push_back(pr);A.usedGen[best]=A.genCounter;}
             else{Hilo h;h.col.push_back(c);h.row.push_back(pr);act.push_back(h);A.usedGen.push_back(A.genCounter);}}
         std::vector<Hilo> nxt;
-        for(size_t k=0;k<act.size();++k){ if(A.usedGen[k]==A.genCounter&&act[k].col.back()==c) nxt.push_back(act[k]); else if(act[k].col.size()>=8) A.rios.push_back(act[k]); }
-        act.swap(nxt);
+        std::vector<unsigned long long> nxtGen;
+        for(size_t k=0;k<act.size();++k){ if(A.usedGen[k]==A.genCounter&&act[k].col.back()==c){ nxt.push_back(act[k]); nxtGen.push_back(A.usedGen[k]); } else if(act[k].col.size()>=8) A.rios.push_back(act[k]); }
+        act.swap(nxt); A.usedGen.swap(nxtGen);
     }
     for(auto&h:act) if(h.col.size()>=8) A.rios.push_back(h);
+    std::cout<<"build_rios: thr="<<thr<<"  crestas="<<A.rios.size()<<"\n";
 }
 static void build_picos(){ A.picos.clear(); const Img&e=A.enh; int W=e.W,H=e.H; float thr=0.45f;
     for(int c=0;c<W;c+=2) for(int r=1;r<H-1;++r){ float v=e.at(r,c); if(v>thr&&v>=e.at(r-1,c)&&v>=e.at(r+1,c)) A.picos.push_back({c,r}); } }
@@ -735,6 +748,7 @@ static void draw_tex_quad(float x0,float y0,float x1,float y1,float u0=0.f,float
 struct FillSeg{ float c0,r0,c1,r1; };           // arista en coords de ESPECTRO (col,fila)
 static std::vector<FillSeg> g_fillSeg;
 static std::vector<float> g_fillX;
+static void draw_rios_2d(float x0,float y0,float x1,float y1,int cLo,int cHi,int rLo,int rHi);  // fwd
 static void draw_overlays(float x0,float y0,float x1,float y1,bool conHilos,int cLo,int cHi,int rLo=0,int rHi=0){
     int H=A.spec.H; if(rHi<=rLo)rHi=H; int span=max(1,cHi-cLo),rspan=max(1,rHi-rLo); float sx=(x1-x0)/span, sy=(y1-y0)/rspan;
     auto xc=[&](float c){ float x=x0+(c-cLo)*sx; return x<x0?x0:(x>x1?x1:x); };
@@ -1164,9 +1178,12 @@ static void render_hud(){ ortho2d(); glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA
         "  play="+(A.solo_banda?"banda(t+f)":"toda-freq(t)")+(PLAYER.paused?"  [PAUSA]":"");
     { char vb[24]; snprintf(vb,24,"  vel=%.1fx",A.playSpeed); s+=vb; }   // velocidad de reproduccion
     if(A.view>=2){const int*p=PERM[A.axperm];s+=std::string("  ejes X=")+DIMN[p[0]]+" Y="+DIMN[p[1]]+" Z="+DIMN[p[2]]+"  res3d="+std::to_string(A.res3d);}
+    if(A.view==3||A.view==6){ s+=std::string("  crestas=")+std::to_string(A.rios.size()); }
     if(A.spec.W>0){ double ny=A.sr*0.5,dr=A.P.dyn_range_db; char fb[120];
         snprintf(fb,120,"  filtro f=%.0f-%.0fHz dB=%.0f..%.0f",A.fLo*ny,A.fHi*ny,(A.dbMin-1)*dr,(A.dbMax-1)*dr); s+=fb; }
-    glColor3f(1,1,1); FONT.at2d(6,14,s); }
+    glColor3f(1,1,1); FONT.at2d(6,14,s);
+    if((A.view==3||A.view==6)&&A.rios.empty()&&A.spec.W>0){
+        ortho2d(); glColor3f(1.f,0.7f,0.3f); FONT.at2d(A.cW/2-120,A.cH/2,"(0 crestas detectadas - ajusta el filtro o la resolucion)"); } }
 // Lectura EN VIVO de lo que apunta el cursor: tiempo (s), frecuencia (Hz/kHz) y nivel (dB).
 // Se dibuja arriba a la derecha (sobre el HUD) solo si el cursor esta sobre un espectrograma:
 // el plot 2D principal (vista 1) o la tira inferior (cualquier vista). dB = (enh-1)*rango, el
@@ -1282,18 +1299,22 @@ static int list_delete_selected(){ if(A.listSel.empty())return 0; push_undo();  
 
 // Crestas del rio dibujadas SOBRE el espectrograma 2D, con el mismo filtro
 // (hilos completos o corte por vertice). Refleja el filtro de hilos en 2D.
-static void draw_rios_2d(float X0,float Y0,float X1,float Y1){
-    int W=A.spec.W,H=A.spec.H; if(W<2)return; float sx=(X1-X0)/W, sy=(Y1-Y0)/H;
+// Recibe la ventana visible (cLo..cHi columnas, rLo..rHi filas) para mapear correctamente.
+static void draw_rios_2d(float x0,float y0,float x1,float y1,int cLo,int cHi,int rLo,int rHi){
+    int H=A.spec.H; if(H<2||A.rios.empty())return;
+    int span=max(1,cHi-cLo),rspan=max(1,rHi-rLo); float sx=(x1-x0)/span, sy=(y1-y0)/rspan;
+    auto xc=[&](float c){ float x=x0+(c-(float)cLo)*sx; return x<x0?x0:(x>x1?x1:x); };
+    auto yc=[&](float r){ float y=y0+(r-(float)rLo)*sy; return y<y0?y0:(y>y1?y1:y); };
     glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA); glLineWidth(1.6f); glColor4f(0.2f,1.f,1.f,0.9f);
     for(auto&h:A.rios){
         if(A.rio_completo){ bool any=false;
             for(size_t k=0;k<h.col.size();++k){ float f=(float)(H-1-h.row[k])/(H-1),e=A.enh.at(h.row[k],h.col[k]); if(pass_filt(f,e)){any=true;break;} }
             if(!any)continue; glBegin(GL_LINE_STRIP);
-            for(size_t k=0;k<h.col.size();++k) glVertex2f(X0+h.col[k]*sx,Y0+h.row[k]*sy); glEnd();
+            for(size_t k=0;k<h.col.size();++k) glVertex2f(xc((float)h.col[k]),yc((float)h.row[k])); glEnd();
         } else { bool pen=false;
             for(size_t k=0;k<h.col.size();++k){ float f=(float)(H-1-h.row[k])/(H-1),e=A.enh.at(h.row[k],h.col[k]);
                 if(!pass_filt(f,e)){ if(pen){glEnd();pen=false;} continue; }
-                if(!pen){glBegin(GL_LINE_STRIP);pen=true;} glVertex2f(X0+h.col[k]*sx,Y0+h.row[k]*sy); }
+                if(!pen){glBegin(GL_LINE_STRIP);pen=true;} glVertex2f(xc((float)h.col[k]),yc((float)h.row[k])); }
             if(pen)glEnd();
         }
     }
