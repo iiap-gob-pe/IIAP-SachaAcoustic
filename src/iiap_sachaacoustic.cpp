@@ -81,6 +81,12 @@ struct AppS {
     std::vector<std::vector<Det>> undo;   // historial para Ctrl+Z (instantaneas de A.dets)
     std::vector<std::vector<Det>> redo;   // historial para Ctrl+Y (rehacer)
 
+    // --- undo/redo para borrador (mascara) ---
+    enum UndoKind { UNDO_LABELS, UNDO_ERASER };
+    std::vector<UndoKind> undoKind, redoKind;   // tipo de cada entrada en undo/redo
+    std::vector<Mask> eraserUndo, eraserRedo;   // historial de mascaras del borrador
+    Mask eraserSnapshot;                         // snapshot al inicio del trazo (antes de pintar)
+
     // --- optimizaciones: mascara espacial, cache de hash, cache de lista ---
     Mask labelMask;                      // mascara W×H: 1=pixel dentro de alguna etiqueta
     bool maskDirty = true;               // reconstruir mascara cuando A.dets cambia
@@ -256,6 +262,7 @@ static void upload_texture();   // forward declaration (def. mas abajo)
 static void eraser_init(){
     int W=A.spec.W, H=A.spec.H;
     A.eraserMask.assign((size_t)W*H, 0);
+    A.eraserUndo.clear(); A.eraserRedo.clear(); A.undoKind.clear(); A.redoKind.clear();
     A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
 }
 static void eraser_paint(int c, int r){
@@ -285,6 +292,7 @@ static void eraser_line(int c0,int r0,int c1,int r1){
 static void eraser_reset_if_filter_changed(){
     if(A.dbMin!=A.prevDbMin||A.dbMax!=A.prevDbMax||A.fLo!=A.prevFLo||A.fHi!=A.prevFHi){
         std::fill(A.eraserMask.begin(),A.eraserMask.end(),0);
+        A.eraserUndo.clear(); A.eraserRedo.clear(); A.undoKind.clear(); A.redoKind.clear();  // invalidar historial del borrador
         A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
         upload_texture();   // re-subir textura SIN la mascara
     }
@@ -438,6 +446,17 @@ static bool load_audio(const std::string& path){ try{
       if(tf.good()){ tf.close(); std::vector<Det> in=import_coco(jp,A.classes);
         if(!in.empty()){ A.dets=in; if(A.clase_activa>=(int)A.classes.size())A.clase_activa=0; layout_botones(); invalidate_dets_caches();
           std::cout<<"Etiquetas cargadas de "<<jp<<": "<<in.size()<<"\n"; } } }
+    // auto-cargar mascara de fondo si existe <nombre_audio>_mask.bmp
+    { std::string stem=A.fname; size_t dp=stem.find_last_of('.'); if(dp!=std::string::npos)stem=stem.substr(0,dp);
+      std::string mp=A.out_dir+"/"+stem+"_mask.bmp"; RGBImg mask=read_bmp(mp);
+      if(mask.W>0&&mask.H>0&&mask.W==A.spec.W&&mask.H==A.spec.H){
+          A.eraserMask.resize((size_t)mask.W*mask.H);
+          for(int r=0;r<mask.H;++r) for(int c=0;c<mask.W;++c){
+              size_t i=((size_t)r*mask.W+c)*3;
+              A.eraserMask[r*mask.W+c]=(mask.d[i]>128||mask.d[i+1]>128||mask.d[i+2]>128)?1:0; }
+          A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+          upload_texture();
+          std::cout<<"Mascara de fondo cargada: "<<mp<<"\n"; } }
     // LIMPIEZA DEFENSIVA: descarta anillos mal ubicados (centroide FUERA del exterior) -> artefactos
     // del bug viejo de coords (anillos en la esquina sup-izq, fuera de su etiqueta). Tambien quita huecos degenerados.
     { int removed=0; for(auto&d:A.dets){ if(d.kind!=KIND_POLY||d.px.size()<3){ d.hx.clear(); d.hy.clear(); continue; }
@@ -627,6 +646,7 @@ static void layout_botones(){
         {"Ocultar",'O',-1,0,"Ocultar / mostrar las etiquetas"},
         {"Lista",'L',-1,0,"Lista de TODAS las etiquetas: clic=selecciona (resalta en 2D); cabecera ordena por tamano; Supr/clic-der borra; Ctrl/Shift/flechas = multiseleccion"},
         {"Limpiar",'c',-1,0,"Borrar TODAS las etiquetas"},
+        {"Masc",'K',-1,0,"Exportar mascara de fondo (BMP: blanco=fondo, negro=senal)"},
         {0,0,0,0,0},
         // --- 3D ---
         {"Res-",'[',-1,0,"Menos resolucion (toda vista: recalcula espectro + 3D)"},{"Res+",']',-1,0,"Mas resolucion (toda vista: recalcula espectro + 3D)"},
@@ -1513,11 +1533,29 @@ static void render(){ glClearColor(0.04f,0.03f,0.06f,1); glViewport(0,0,A.cW,A.c
 
 // ---------------- acciones ----------
 // historial para Ctrl+Z: guarda una instantanea de las etiquetas ANTES de modificarlas.
-static void push_undo(){ A.undo.push_back(A.dets); if(A.undo.size()>50)A.undo.erase(A.undo.begin()); A.redo.clear(); }
-static void do_undo(){ if(A.undo.empty())return; A.redo.push_back(A.dets); A.dets=A.undo.back(); A.undo.pop_back();
-    A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.listSel.clear(); A.dirty=true; invalidate_dets_caches(); std::cout<<"Deshacer ("<<A.undo.size()<<" deshacer, "<<A.redo.size()<<" rehacer)\n"; }
-static void do_redo(){ if(A.redo.empty())return; A.undo.push_back(A.dets); A.dets=A.redo.back(); A.redo.pop_back();
-    A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.listSel.clear(); A.dirty=true; invalidate_dets_caches(); std::cout<<"Rehacer ("<<A.undo.size()<<" deshacer, "<<A.redo.size()<<" rehacer)\n"; }
+static void push_undo(){ A.undo.push_back(A.dets); A.undoKind.push_back(A.UNDO_LABELS);
+    if(A.undo.size()>50){ A.undo.erase(A.undo.begin()); A.undoKind.erase(A.undoKind.begin()); }
+    A.redo.clear(); A.redoKind.clear(); A.eraserRedo.clear(); }
+// historial para Ctrl+Z del borrador: guarda la mascara ANTES de pintar.
+static void push_eraser_undo(){ A.undo.push_back(A.dets); A.undoKind.push_back(A.UNDO_ERASER); A.eraserUndo.push_back(A.eraserSnapshot);
+    if(A.undo.size()>50){ A.undo.erase(A.undo.begin()); A.undoKind.erase(A.undoKind.begin()); if(!A.eraserUndo.empty())A.eraserUndo.erase(A.eraserUndo.begin()); }
+    A.redo.clear(); A.redoKind.clear(); A.eraserRedo.clear(); }
+static void do_undo(){
+    if(A.undo.empty())return;
+    A.redo.push_back(A.dets); A.redoKind.push_back(A.undoKind.back());
+    if(A.undoKind.back()==A.UNDO_ERASER){ A.eraserRedo.push_back(A.eraserMask); A.dets=A.undo.back(); A.eraserMask=A.eraserUndo.back(); A.eraserUndo.pop_back(); upload_texture(); }
+    else { A.dets=A.undo.back(); }
+    A.undo.pop_back(); A.undoKind.pop_back();
+    A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.listSel.clear(); A.dirty=true; invalidate_dets_caches();
+    std::cout<<"Deshacer ("<<A.undo.size()<<" deshacer, "<<A.redo.size()<<" rehacer)\n"; }
+static void do_redo(){
+    if(A.redo.empty())return;
+    A.undo.push_back(A.dets); A.undoKind.push_back(A.redoKind.back());
+    if(A.redoKind.back()==A.UNDO_ERASER){ A.eraserUndo.push_back(A.eraserMask); A.dets=A.redo.back(); A.eraserMask=A.eraserRedo.back(); A.eraserRedo.pop_back(); upload_texture(); }
+    else { A.dets=A.redo.back(); }
+    A.redo.pop_back(); A.redoKind.pop_back();
+    A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.listSel.clear(); A.dirty=true; invalidate_dets_caches();
+    std::cout<<"Rehacer ("<<A.undo.size()<<" deshacer, "<<A.redo.size()<<" rehacer)\n"; }
 // Selecciona la etiqueta bajo (c,r). Si hay varias solapadas (p.ej. una PEQUENA dentro de
 // otra GRANDE) elige la de MENOR area, para poder seleccionar/editar la interior. Para
 // poligonos exige que el punto caiga dentro de la forma real (pt_in_poly), no solo del bbox.
@@ -1672,6 +1710,37 @@ static void guardar(bool silent=false){ if(A.spec.W<1)return; std::string stem=A
     RavenGeom g{A.spec.W,A.spec.H,A.sr,A.P.hop}; export_raven(base+".txt",A.dets,A.classes,g);
     A.dirty=false;
     std::cout<<(silent?"Autosave ":"Guardado ")<<base<<".json + .txt(Raven) ("<<A.dets.size()<<" etiquetas)\n"; }
+// --- Exportar/importar mascara de fondo (BMP: blanco=fondo, negro=senal) ---
+static std::string mask_path_for_current(){ std::string stem=A.fname; { size_t p=stem.find_last_of('.'); if(p!=std::string::npos)stem=stem.substr(0,p); }
+    if(stem.empty()||stem=="(sin archivo)")stem="etiquetas"; return A.out_dir+"/"+stem+"_mask.bmp"; }
+static void export_background_mask(){
+    if(A.spec.W<1) return;
+    int W=A.spec.W, H=A.spec.H;
+    RGBImg mask(W,H);
+    bool hasMask=!A.eraserMask.empty();
+    for(int r=0;r<H;++r){ float f=(float)(H-1-r)/(H-1);
+        for(int c=0;c<W;++c){ float e=A.enh.at(r,c);
+            bool isBg = (e < A.dbMin) || (e > A.dbMax) || (hasMask && A.eraserMask[r*W+c]) || (e < 0.02f);
+            size_t i=((size_t)r*W+c)*3;
+            uint8_t v = isBg ? 255 : 0;
+            mask.d[i]=v; mask.d[i+1]=v; mask.d[i+2]=v; } }
+    std::string path=mask_path_for_current();
+    if(write_bmp(path,mask)) std::cout<<"Mascara de fondo exportada: "<<path<<"\n";
+    else std::cout<<"Error al exportar mascara: "<<path<<"\n"; }
+static void load_background_mask(){
+    std::string path=mask_path_for_current();
+    RGBImg mask=read_bmp(path);
+    if(mask.W<1||mask.H<1){ std::cout<<"No se encontro mascara: "<<path<<"\n"; return; }
+    if(mask.W!=A.spec.W||mask.H!=A.spec.H){ std::cout<<"Dimensiones de mascara no coinciden: "<<mask.W<<"x"<<mask.H<<" vs "<<A.spec.W<<"x"<<A.spec.H<<"\n"; return; }
+    int W=mask.W, H=mask.H;
+    A.eraserMask.resize((size_t)W*H);
+    for(int r=0;r<H;++r) for(int c=0;c<W;++c){
+        size_t i=((size_t)r*W+c)*3;
+        // Blanco (cualquier canal > 128) -> fondo (eraserMask=1); negro -> normal (0)
+        A.eraserMask[r*W+c] = (mask.d[i]>128 || mask.d[i+1]>128 || mask.d[i+2]>128) ? 1 : 0; }
+    A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+    upload_texture();
+    std::cout<<"Mascara de fondo cargada: "<<path<<"\n"; }
 // firma (hash) del estado de etiquetas: detecta CUALQUIER cambio para el autosave
 // Cache: solo recalcula cuando labelsSigDirty=true (marca invalidate_dets_caches).
 static unsigned long long compute_labels_sig(){ unsigned long long s=1469598103934665603ULL;
@@ -1779,9 +1848,10 @@ static void do_action(int c){
     else if(c=='z'&&A.sel>=0){push_undo();A.dets[A.sel].cls=A.clase_activa;A.dirty=true;invalidate_dets_caches();}    // asigna la clase activa al seleccionado
     else if(c=='c'){push_undo();A.dets.clear();A.hilos.clear();A.sel=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();A.listSel.clear();invalidate_dets_caches();}
     else if(c=='s')guardar();
+    else if(c=='K')export_background_mask();   // exportar mascara de fondo
 }
 static void ayuda(){ std::cout<<"\n=== raven.exe ===\n Botones arriba o teclas: o abrir, 1-5 vistas, ESPACIO play sel, p todo, k pausa, . stop,\n"
-    " a auto, l caja, t hilo, b/n clase, z asig cl, d borrador, Supr borra, c limpia, s guarda, r ejes(3D), q salir.\n"
+    " a auto, l caja, t hilo, b/n clase, z asig cl, d borrador, Supr borra, c limpia, s guarda, K mascara fondo, r ejes(3D), q salir.\n"
     " Etiqueta arrastrando en la vista 2D o en la tira inferior (sirve en 3D). Arrastrar selecciona\n"
     " tiempo+frecuencia; ESPACIO reproduce SOLO esa banda. Clic simple = mover playhead (seek).\n"; }
 
@@ -2281,8 +2351,8 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                     if(A.sel<0) A.sel=caja_en(c,r);               // si no habia ninguno seleccionado, selecciona uno para empezar a editar; si ya habia, NO cambia (Editar solo trabaja sobre el seleccionado; Esc o Selec para cambiar)
                     A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.editVert=-1; A.editHole=-1; A.dragging=false;A.dragRegion=0; } }
             else if(A.tool==T_CUT){ A.dragRegion=7; A.cutX.push_back(c); A.cutY.push_back(r); }  // pinta el trazo de corte
-            else if(A.tool==T_ERASER){ A.eraserDragging=true; A.eraserPrevC=c; A.eraserPrevR=r;
-                eraser_paint(c,r); upload_texture(); A.dragRegion=7; }  // borrador: pinta y arrastra
+            else if(A.tool==T_ERASER){ A.eraserSnapshot=A.eraserMask; A.eraserDragging=true; A.eraserPrevC=c; A.eraserPrevR=r;
+                eraser_paint(c,r); upload_texture(); A.dragRegion=7; }  // borrador: pinta y arrastra (snapshot para Ctrl+Z)
             else if(A.tool==T_MERGE){  // UNIR: clic en una etiqueta para seleccionarla/combina
                 int hit=caja_en(c,r);
                 if(hit>=0){
@@ -2364,7 +2434,9 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                         d.px.insert(d.px.begin()+A.pendEdge+1,A.pendEdgeC); d.py.insert(d.py.begin()+A.pendEdge+1,A.pendEdgeR);
                         sync_bbox_from_poly(d); A.dirty=true; A.selDet=A.sel; A.selVert=A.pendEdge+1; A.selVertHole=-1; A.selVerts.clear(); } } }
             A.pendEdge=-1; A.pendEdgeHole=-1; return 0; }
-        if(A.dragRegion==7){ A.dragRegion=0; A.eraserDragging=false; return 0; }   // corte libre / borrador: se sigue pintando
+        if(A.dragRegion==7){ A.dragRegion=0; A.eraserDragging=false;
+            if(A.eraserMask!=A.eraserSnapshot) push_eraser_undo();   // guarda en historial si la mascara cambio
+            return 0; }   // corte libre / borrador: se sigue pintando
         if(A.dragRegion==1||A.dragRegion==2){ int c0,r0,c1,r1;                 // SELECCION (etiquetar)
             if(A.dragRegion==1){main_to_spec(A.dx0,A.dy0,c0,r0);main_to_spec(mx,my,c1,r1);}
             else{strip_to_spec(A.dx0,A.dy0,c0,r0);strip_to_spec(mx,my,c1,r1);}
@@ -2505,8 +2577,9 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         if(A.listOpen){ float lx,ly,lw,lh; list_rect(lx,ly,lw,lh);   // rueda sobre la LISTA = scroll de la lista
             if(pt.x>=lx&&pt.x<=lx+lw&&pt.y>=ly&&pt.y<=ly+lh){ A.listScroll+=(dz>0?-3:3); if(A.listScroll<0)A.listScroll=0; return 0; } }
         if(A.spec.W>0 && pt.y>=panel_y0()){ scroll_pan(dz>0?-1:1); return 0; }   // rueda sobre el AREA INFERIOR (tira+oscilograma+scroll, donde se ve la ventana) = mueve la ventana de tiempo
-        if(A.tool==T_ERASER&&A.view==1&&A.spec.W>0 && pt.x>=plotX0()-2&&pt.x<=plotX1()+2&&pt.y>=plotY0()-2&&pt.y<=plotY1()+2){   // rueda sobre espectrograma con borrador = ajustar radio
-            A.eraserRadius=max(1,min(50,A.eraserRadius+(dz>0?1:-1))); return 0; }
+        if(A.tool==T_ERASER&&A.view==1&&A.spec.W>0 && pt.x>=plotX0()-2&&pt.x<=plotX1()+2&&pt.y>=plotY0()-2&&pt.y<=plotY1()+2){
+            if(GetKeyState(VK_CONTROL)&0x8000){ int c,r; main_to_spec(pt.x,pt.y,c,r); zoom2d(dz>0?0.8f:1.25f,c,r); }  // Ctrl+rueda = zoom
+            else A.eraserRadius=max(1,min(50,A.eraserRadius+(dz>0?1:-1))); return 0; }
         if(A.view==1&&A.spec.W>0 && pt.x>=plotX0()-2&&pt.x<=plotX1()+2&&pt.y>=plotY0()-2&&pt.y<=plotY1()+2){   // rueda sobre el espectrograma 2D = ZOOM hacia el cursor
             int c,r; main_to_spec(pt.x,pt.y,c,r); zoom2d(dz>0?0.8f:1.25f,c,r); return 0; }
         A.dist*=(dz>0)?0.9f:1.1f; A.dist=max(0.5f,min(20.f,A.dist)); return 0; }
