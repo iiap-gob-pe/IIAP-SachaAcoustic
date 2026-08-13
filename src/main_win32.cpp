@@ -43,8 +43,7 @@ static const char* CLS_NAME = "EtiquetadorEspectro";
 
 static void recompute_enhanced() {
     Img base = enhance_asinh(A.spec, 0.07);
-    A.enhanced = A.usar_gate ? base : base;  // (gate opcional; asinh fiel por defecto)
-    // Nota: el gate por banda se puede reactivar aqui si se desea.
+    A.enhanced = base;  // asinh fiel por defecto
 }
 
 static void rebuild_dib() {
@@ -99,14 +98,14 @@ static void paint(HWND hwnd) {
         HGDIOBJ op = SelectObject(hdc, pen); HGDIOBJ ob = SelectObject(hdc, hollow);
         int x0 = (int)(d.x * A.scale), y0 = (int)(d.y * A.scale) + 20;
         int x1 = (int)((d.x + d.w) * A.scale), y1 = (int)((d.y + d.h) * A.scale) + 20;
-        Rectangle(hdc, x0, y0, x1, y1);
-        // poligono de segmentacion
-        if (d.px.size() >= 3) {
+        if (d.kind == KIND_POLY && d.px.size() >= 3) {
             std::vector<POINT> pts(d.px.size() + 1);
             for (size_t k = 0; k < d.px.size(); ++k)
                 pts[k] = {(LONG)(d.px[k] * A.scale), (LONG)(d.py[k] * A.scale) + 20};
             pts[d.px.size()] = pts[0];
             Polyline(hdc, pts.data(), (int)pts.size());
+        } else {
+            Rectangle(hdc, x0, y0, x1, y1);
         }
         SetTextColor(hdc, col);
         TextOutA(hdc, x0 + 2, (y0 > 22 ? y0 - 15 : y0), nombre_clase(d.cls),

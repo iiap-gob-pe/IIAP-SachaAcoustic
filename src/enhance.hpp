@@ -8,50 +8,73 @@
 #include "types.hpp"
 #include "magma_lut.hpp"
 
-// Normaliza a [0,1] con percentiles suaves (p0.1-p99.9): casi no recorta.
-// Usa nth_element (O(N)) en vez de sort completo (O(N log N)) -> mas rapido en imagenes grandes.
-inline Img percentile_rescale(const Img& m, double p_lo = 0.1, double p_hi = 99.9) {
-    std::vector<float> v = m.d;
+// Helper: percentiles usando nth_element (O(N)).
+inline void find_percentiles(const std::vector<float>& v, float& lo, float& hi,
+                             double p_lo = 0.1, double p_hi = 99.9) {
     auto pct = [&](double p) {
         size_t i = (size_t)std::min(std::max(0.0, p / 100.0 * (v.size() - 1)),
                                     (double)(v.size() - 1));
-        std::nth_element(v.begin(), v.begin() + i, v.end());
-        return v[i];
+        std::vector<float> tmp = v;
+        std::nth_element(tmp.begin(), tmp.begin() + i, tmp.end());
+        return tmp[i];
     };
-    float lo = pct(p_lo), hi = pct(p_hi), den = std::max(1e-6f, hi - lo);
-    Img out(m.W, m.H);
-    for (size_t i = 0; i < m.d.size(); ++i) {
-        float x = (m.d[i] - lo) / den;
-        out.d[i] = x < 0 ? 0 : (x > 1 ? 1 : x);
+    lo = pct(p_lo);
+    hi = pct(p_hi);
+}
+
+// asinh fusionado: encuentra percentiles y aplica asinh normalizado en UN solo pase.
+// Produce resultado identico a percentile_rescale + enhance_asinh separados.
+inline Img enhance_asinh(const Img& g_in, double beta = 0.07) {
+    const auto& src = g_in.d;
+    int W = g_in.W, H = g_in.H;
+    // Paso 1: encontrar percentiles p0.1 y p99.9
+    float lo, hi;
+    find_percentiles(src, lo, hi);
+    float den = std::max(1e-6f, hi - lo);
+    float norm = (float)std::asinh(1.0 / beta);
+    // Paso 2: normalizar + asinh en un solo pase (sin imagen intermedia)
+    Img out(W, H);
+    for (size_t i = 0; i < src.size(); ++i) {
+        float x = (src[i] - lo) / den;
+        x = x < 0 ? 0 : (x > 1 ? 1 : x);
+        out.d[i] = (float)std::asinh(x / beta) / norm;
     }
     return out;
 }
 
-// asinh: lineal para chicos, log para grandes. beta chico = levanta debiles.
-inline Img enhance_asinh(const Img& g_in, double beta = 0.07) {
-    Img g = percentile_rescale(g_in);
-    Img out(g.W, g.H);
-    float norm = (float)std::asinh(1.0 / beta);
-    for (size_t i = 0; i < g.d.size(); ++i)
-        out.d[i] = (float)std::asinh(g.d[i] / beta) / norm;
-    return out;
-}
-
 // mu-law (companding de audio). mu mayor = mas compresion.
+// Fusión: percentiles + mu-law en un solo pase.
 inline Img enhance_mulaw(const Img& g_in, double mu = 100.0) {
-    Img g = percentile_rescale(g_in);
-    Img out(g.W, g.H);
-    float den = (float)std::log1p(mu);
-    for (size_t i = 0; i < g.d.size(); ++i)
-        out.d[i] = (float)std::log1p(mu * g.d[i]) / den;
+    const auto& src = g_in.d;
+    int W = g_in.W, H = g_in.H;
+    float lo, hi;
+    find_percentiles(src, lo, hi);
+    float den = std::max(1e-6f, hi - lo);
+    float mu_f = (float)mu;
+    float log_den = (float)std::log1p(mu);
+    Img out(W, H);
+    for (size_t i = 0; i < src.size(); ++i) {
+        float x = (src[i] - lo) / den;
+        x = x < 0 ? 0 : (x > 1 ? 1 : x);
+        out.d[i] = (float)std::log1p(mu_f * x) / log_den;
+    }
     return out;
 }
 
+// gamma: percentiles + gamma en un solo pase.
 inline Img enhance_gamma(const Img& g_in, double gamma = 0.45) {
-    Img g = percentile_rescale(g_in);
-    Img out(g.W, g.H);
-    for (size_t i = 0; i < g.d.size(); ++i)
-        out.d[i] = std::pow(g.d[i], (float)gamma);
+    const auto& src = g_in.d;
+    int W = g_in.W, H = g_in.H;
+    float lo, hi;
+    find_percentiles(src, lo, hi);
+    float den = std::max(1e-6f, hi - lo);
+    float g = (float)gamma;
+    Img out(W, H);
+    for (size_t i = 0; i < src.size(); ++i) {
+        float x = (src[i] - lo) / den;
+        x = x < 0 ? 0 : (x > 1 ? 1 : x);
+        out.d[i] = std::pow(x, g);
+    }
     return out;
 }
 

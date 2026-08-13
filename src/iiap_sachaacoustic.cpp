@@ -36,7 +36,7 @@ struct Boton { int x, y, w, h; std::string label; int key; int icon; std::string
 
 // Herramientas de etiquetado (A.tool)
 // Herramientas: seleccionar, etiquetar bounding-box, etiquetar poligono, editar, cortar
-enum { T_SELECT = 0, T_BBOX = 1, T_POLY = 2, T_EDIT = 3, T_CUT = 4 };
+enum { T_SELECT = 0, T_BBOX = 1, T_POLY = 2, T_EDIT = 3, T_CUT = 4, T_MERGE = 5, T_ERASER = 6 };
 
 struct AppS {
     AudioData audio; int sr = 0;
@@ -60,6 +60,7 @@ struct AppS {
     float gain = 1.0f;               // ganancia de reproduccion (1=normalizado; >1 sube mas)
     float playSpeed = 1.0f;          // velocidad de reproduccion (1.0x); <1 lento+grave (expansion temporal), >1 rapido
     bool hide_labels = false;        // ocultar etiquetas (cajas/poligonos) del dibujo
+    bool show_mask = true;           // mostrar/ocultar efecto de la mascara del borrador en el espectrograma
     float volFLo=0.f, volFHi=1.f, volDbMin=0.f, volDbMax=1.f;  // filtros LOCALES de la vista Volumen
     std::vector<int> polyX, polyY;   // poligono en construccion (modo poligono a mano)
     std::vector<int> cutX, cutY;     // trazo de corte LIBRE (modo Cortar); clic-der ejecuta
@@ -67,6 +68,7 @@ struct AppS {
     bool dirty = false;              // hay cambios sin guardar -> autosave
     unsigned long long lastSig = 0; bool sigInit = false;   // firma de etiquetas para autosave
     bool buffering = false; int bufSel = -1; Det bufOrig; int bufOrigBuf = 0;  // modal de buffer (con copia para cancelar)
+    bool refining = false; int refineRadius = 2; float refineDensity = 0.15f;   // modal de refinamiento: radio + densidad minima
     int editVert = -1;               // poligono: vertice en edicion ; bbox: 100+manija, 108 mover
     int editHole = -1;               // editar: -1 = contorno exterior ; >=0 = indice del HUECO/anillo en edicion
     int lastEditC = 0, lastEditR = 0;// ultima posicion (spec) al mover un poligono (para trasladar)
@@ -79,6 +81,33 @@ struct AppS {
     int pendEdge=-1, pendEdgeC=0, pendEdgeR=0;   // EDITAR: insercion de punto PENDIENTE (solo si el clic NO se arrastra)
     int pickHole=-1, pendEdgeHole=-1;            // EDITAR: -1 = arista del contorno exterior ; >=0 = arista del HUECO/anillo
     std::vector<std::vector<Det>> undo;   // historial para Ctrl+Z (instantaneas de A.dets)
+    std::vector<std::vector<Det>> redo;   // historial para Ctrl+Y (rehacer)
+
+    // --- undo/redo para borrador (mascara) ---
+    enum UndoKind { UNDO_LABELS, UNDO_ERASER };
+    std::vector<UndoKind> undoKind, redoKind;   // tipo de cada entrada en undo/redo
+    std::vector<Mask> eraserUndo, eraserRedo;   // historial de mascaras del borrador
+    Mask eraserSnapshot;                         // snapshot al inicio del trazo (antes de pintar)
+
+    // --- optimizaciones: mascara espacial, cache de hash, cache de lista ---
+    Mask labelMask;                      // mascara W×H: 1=pixel dentro de alguna etiqueta
+    bool maskDirty = true;               // reconstruir mascara cuando A.dets cambia
+    unsigned long long cachedLabelSig = 0;  // hash cacheado de A.dets
+    bool labelsSigDirty = true;          // recalcular hash cuando A.dets cambia
+    std::vector<int> cachedListOrder;    // orden de display cacheado
+    bool listOrderDirty = true;          // reconstruir cuando cambia A.dets o listSortSize
+    std::vector<bool> listSelBitmap;     // bitmap: listSelBitmap[i]=true si i esta en listSel
+    bool listSelDirty = true;            // reconstruir cuando cambia listSel
+    unsigned long long genCounter = 0;   // generation counter para build_rios
+    std::vector<unsigned long long> usedGen;  // vector de generaciones para evitar allocs
+
+    // --- borrador temporal (mascara por filtro) ---
+    std::vector<uint8_t> eraserMask;     // mascara W*H: 0=normal, 1=borrado
+    int eraserRadius = 5;                // radio del pincel (ajustable con rueda)
+    bool eraserDragging = false;         // clic izq presionado dibujando
+    int eraserPrevC = -1, eraserPrevR = -1;  // ultimo pixel de spec dibujado
+    float prevDbMin = 0.f, prevDbMax = 1.f;  // para detectar cambios de filtro
+    float prevFLo = 0.f, prevFHi = 1.f;
 
     // seleccion en coords de espectro (tiempo c, frecuencia r)
     int sc0 = -1, sc1 = -1, sr0 = -1, sr1 = -1;
@@ -89,6 +118,7 @@ struct AppS {
     bool solo_banda = true;     // reproducir solo la banda (freq) de la seleccion
     bool rio_completo = false;  // rio: mostrar el hilo COMPLETO si algun punto pasa el filtro
     bool quiver_completo = true;// quiver: glifos completos por hilo (vs solo puntos que pasan)
+    int mergeFirst = -1;        // primera etiqueta seleccionada para unir (-1 = ninguna)
     int mx = 0, my = 0;         // posicion del raton (para tooltips)
 
     float yaw = -40, pitch = 22, dist = 4.0f; int axperm = 0;
@@ -121,6 +151,10 @@ struct AppS {
     std::vector<Boton> botones;
     std::string out_dir = ".";
     std::string fname = "(sin archivo)";   // nombre del WAV cargado
+
+    // --- prompt de mascara al arrastrar BMP ---
+    bool maskPromptOpen = false;            // hay un dialogo de confirmacion de mascara abierto
+    std::string maskPromptPath;             // path del BMP que se intento arrastrar
 };
 static AppS A;
 static AudioPlayer PLAYER;
@@ -132,6 +166,15 @@ static bool g_dialogOpen = false;                       // hay un dialogo Abrir/
 static void show_busy(const std::string& msg);         // indicador de carga (def. mas abajo)
 static void layout_botones();                           // (def. mas abajo) recalcula barra/paleta
 static unsigned long long labels_sig();                 // (def. mas abajo) firma de etiquetas (autosave)
+static void guardar(bool silent);                         // (def. mas abajo) guardar etiquetas COCO+Raven
+// Invalida TODOS los flags de cache dependientes de A.dets.
+// Llamar despues de cualquier mutacion de A.dets (push_back, erase, asignacion, etc.)
+static void invalidate_dets_caches() {
+    A.maskDirty = true;
+    A.labelsSigDirty = true;
+    A.listOrderDirty = true;
+    A.listSelDirty = true;
+}
 static const char* CLS = "RavenLikeGL";
 
 static const int HUD_H = 20;
@@ -171,6 +214,7 @@ static float& flt_dbMax(){ return A.view==7?A.volDbMax:A.dbMax; }
 static void spec_to_main(float c,float r,float&sx,float&sy);   // def. mas abajo
 static void sync_bbox_from_poly(Det&d);                        // def. mas abajo
 static void push_undo();                                       // (def. mas abajo) snapshot para Ctrl+Z
+static void push_eraser_undo();                                // (def. mas abajo) snapshot de mascara para Ctrl+Z
 static bool list_is_sel(int i);                                // (def. mas abajo) ¿el det i esta en la seleccion de la LISTA?
 // modal de buffer: rectangulo de la pista del slider {tx0,tx1,ty}
 static void bufslider(float& tx0,float& tx1,float& ty){ float w=400,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-45;
@@ -220,6 +264,48 @@ static void colorf(float v, float& r, float& g, float& b) {
 static size_t next_pow2(size_t n){ size_t p=1; while(p<n) p<<=1; return p; }
 // filtro: pasa si freq-fraccion en [fLo,fHi] y energia >= dbMin
 static bool pass_filt(float f,float e){ return f>=A.fLo && f<=A.fHi && e>=A.dbMin && e<=A.dbMax; }
+static void upload_texture();   // forward declaration (def. mas abajo)
+static bool load_mask_from_path(const std::string& path);   // forward declaration (def. mas abajo)
+
+// ---- borrador temporal ----
+static void eraser_init(){
+    int W=A.spec.W, H=A.spec.H;
+    A.eraserMask.assign((size_t)W*H, 0);
+    A.eraserUndo.clear(); A.eraserRedo.clear(); A.undoKind.clear(); A.redoKind.clear();
+    A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+}
+static void eraser_paint(int c, int r){
+    int W=A.spec.W, H=A.spec.H;
+    if(W<1||H<1||A.eraserMask.empty()) return;
+    int rad=A.eraserRadius;
+    for(int dr=-rad;dr<=rad;++dr){
+        for(int dc=-rad;dc<=rad;++dc){
+            if(dc*dc+dr*dr>rad*rad) continue;
+            int rr=r+dr, cc=c+dc;
+            if(rr>=0&&rr<H&&cc>=0&&cc<W) A.eraserMask[(size_t)rr*W+cc]=1;
+        }
+    }
+}
+static void eraser_line(int c0,int r0,int c1,int r1){
+    int dx=std::abs(c1-c0), sx=c0<c1?1:-1;
+    int dy=-std::abs(r1-r0), sy=r0<r1?1:-1;
+    int err=dx+dy;
+    for(;;){
+        eraser_paint(c0,r0);
+        if(c0==c1&&r0==r1) break;
+        int e2=2*err;
+        if(e2>=dy){err+=dy;c0+=sx;}
+        if(e2<=dx){err+=dx;r0+=sy;}
+    }
+}
+static void eraser_reset_if_filter_changed(){
+    if(A.dbMin!=A.prevDbMin||A.dbMax!=A.prevDbMax||A.fLo!=A.prevFLo||A.fHi!=A.prevFHi){
+        std::fill(A.eraserMask.begin(),A.eraserMask.end(),0);
+        A.eraserUndo.clear(); A.eraserRedo.clear(); A.undoKind.clear(); A.redoKind.clear();  // invalidar historial del borrador
+        A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+        upload_texture();   // re-subir textura SIN la mascara
+    }
+}
 
 // ---- clases dinamicas ----
 static void class_color(int c, float& r, float& g, float& b){
@@ -258,20 +344,34 @@ static int rhi(){ int H=A.spec.H; int b=(A.vr1>A.vr0)?A.vr1:H; b=min(H,b); if(H<
 
 // ---------------- analisis: crestas, picos, hilos, oscilograma ----------
 static void build_rios() {
-    A.rios.clear(); const Img& e = A.enh; int W=e.W,H=e.H; float thr=0.35f;
+    A.rios.clear(); const Img& e = A.enh; int W=e.W,H=e.H;
+    if(W<2||H<2){ std::cout<<"build_rios: espectrograma demasiado pequeno ("<<W<<"x"<<H<<")\n"; return; }
+    // Umbral adaptativo: percentil p20 del espectrograma mejorado (robusto al nivel del audio)
+    std::vector<float> vals; vals.reserve((size_t)W*H/4);
+    for(int c=0;c<W;c+=2) for(int r=1;r<H-1;r+=2) vals.push_back(e.at(r,c));
+    float thr=0.35f;  // default por si no hay datos
+    if(vals.size()>=8){
+        size_t idx=vals.size()/5;  // p20
+        std::nth_element(vals.begin(),vals.begin()+idx,vals.end());
+        float p20=vals[idx];
+        thr=max(0.08f, min(0.50f, p20*1.2f));  // 1.2x el p20, acotado en [0.08, 0.50]
+    }
     std::vector<Hilo> act;
     for (int c=0;c<W;++c){
+        ++A.genCounter;  // generation counter POR COLUMNA: evita que un hilo absorba 2 picos en la misma col
         std::vector<int> pk;
         for(int r=1;r<H-1;++r){ float v=e.at(r,c); if(v>thr&&v>=e.at(r-1,c)&&v>=e.at(r+1,c)) pk.push_back(r);}
-        std::vector<bool> used(act.size(),false);
-        for(int pr:pk){ int best=-1,bd=6; for(size_t k=0;k<act.size();++k){ if(used[k])continue; int d=std::abs(act[k].row.back()-pr); if(d<bd){bd=d;best=(int)k;}}
-            if(best>=0){act[best].col.push_back(c);act[best].row.push_back(pr);used[best]=true;}
-            else{Hilo h;h.col.push_back(c);h.row.push_back(pr);act.push_back(h);used.push_back(true);}}
+        // Generation counter en vez de vector<bool> used: misma logica, cero allocs
+        for(int pr:pk){ int best=-1,bd=6; for(size_t k=0;k<act.size();++k){ if(A.usedGen[k]==A.genCounter)continue; int d=std::abs(act[k].row.back()-pr); if(d<bd){bd=d;best=(int)k;}}
+            if(best>=0){act[best].col.push_back(c);act[best].row.push_back(pr);A.usedGen[best]=A.genCounter;}
+            else{Hilo h;h.col.push_back(c);h.row.push_back(pr);act.push_back(h);A.usedGen.push_back(A.genCounter);}}
         std::vector<Hilo> nxt;
-        for(size_t k=0;k<act.size();++k){ if(used[k]&&act[k].col.back()==c) nxt.push_back(act[k]); else if(act[k].col.size()>=8) A.rios.push_back(act[k]); }
-        act.swap(nxt);
+        std::vector<unsigned long long> nxtGen;
+        for(size_t k=0;k<act.size();++k){ if(A.usedGen[k]==A.genCounter&&act[k].col.back()==c){ nxt.push_back(act[k]); nxtGen.push_back(A.usedGen[k]); } else if(act[k].col.size()>=8) A.rios.push_back(act[k]); }
+        act.swap(nxt); A.usedGen.swap(nxtGen);
     }
     for(auto&h:act) if(h.col.size()>=8) A.rios.push_back(h);
+    std::cout<<"build_rios: thr="<<thr<<"  crestas="<<A.rios.size()<<"\n";
 }
 static void build_picos(){ A.picos.clear(); const Img&e=A.enh; int W=e.W,H=e.H; float thr=0.45f;
     for(int c=0;c<W;c+=2) for(int r=1;r<H-1;++r){ float v=e.at(r,c); if(v>thr&&v>=e.at(r-1,c)&&v>=e.at(r+1,c)) A.picos.push_back({c,r}); } }
@@ -289,9 +389,11 @@ static void build_env(){ A.envMin.assign(A.NB,0); A.envMax.assign(A.NB,0);
 
 // ---------------- carga ----------
 static void upload_texture(){ int W=A.enh.W,H=A.enh.H; RGBImg c(W,H);
+    bool hasMask=!A.eraserMask.empty() && A.show_mask;
     for(int r=0;r<H;++r){ float f=(float)(H-1-r)/(H-1);
         for(int x=0;x<W;++x){ float e=A.enh.at(r,x); size_t i=((size_t)r*W+x)*3;
-            if(pass_filt(f,e)){ int k=(int)(min(1.f,max(0.f,e))*255+0.5f);
+            if(pass_filt(f,e) && (!hasMask||A.eraserMask[r*W+x]==0)){
+                int k=(int)(min(1.f,max(0.f,e))*255+0.5f);
                 c.d[i]=A.cmapLUT[k][0];c.d[i+1]=A.cmapLUT[k][1];c.d[i+2]=A.cmapLUT[k][2]; }
             else { c.d[i]=c.d[i+1]=c.d[i+2]=0; } } }
     if(!A.tex)glGenTextures(1,&A.tex);
@@ -311,6 +413,7 @@ static bool pt_in_det(const Det& d,float x,float y){
         for(size_t k=0;k<d.hx.size();++k) if(d.hx[k].size()>=3&&pt_in_poly(d.hx[k],d.hy[k],x,y))return false; return true; }
     return (x>=d.x&&x<d.x+d.w&&y>=d.y&&y<d.y+d.h); }
 
+
 // cierra el poligono en construccion como un Det de la clase activa
 static void finish_poly(){ if(A.polyX.size()<3){A.polyX.clear();A.polyY.clear();return;}
     push_undo();
@@ -318,8 +421,10 @@ static void finish_poly(){ if(A.polyX.size()<3){A.polyX.clear();A.polyY.clear();
     int mnx=d.px[0],mxx=d.px[0],mny=d.py[0],mxy=d.py[0];
     for(size_t k=0;k<d.px.size();++k){mnx=min(mnx,d.px[k]);mxx=max(mxx,d.px[k]);mny=min(mny,d.py[k]);mxy=max(mxy,d.py[k]);}
     d.x=mnx;d.y=mny;d.w=max(1,mxx-mnx);d.h=max(1,mxy-mny);
-    A.dets.push_back(std::move(d)); A.sel=(int)A.dets.size()-1; A.polyX.clear();A.polyY.clear(); }
+    A.dets.push_back(std::move(d)); A.sel=(int)A.dets.size()-1; A.polyX.clear();A.polyY.clear(); invalidate_dets_caches(); }
 static bool load_audio(const std::string& path){ try{
+    PLAYER.stop();                                                              // detener reproduccion del audio anterior
+    A.maskPromptOpen=false;                                                     // cerrar prompt de mascara si estaba abierto
     { size_t p=path.find_last_of("/\\"); show_busy(std::string("Cargando ")+((p==std::string::npos)?path:path.substr(p+1))+" ..."); }
     A.audio=load_wav(path); A.sr=A.audio.sample_rate;
     // RENDIMIENTO: para audios LARGOS o de alta frecuencia (ultrasonico), el espectrograma
@@ -332,15 +437,16 @@ static bool load_audio(const std::string& path){ try{
       A.P.hop=max(base,hop); }
     A.spec=compute_spectrogram(A.audio,A.P);
     { size_t p=path.find_last_of("/\\"); if(p!=std::string::npos){ A.out_dir=path.substr(0,p); A.fname=path.substr(p+1); } else A.fname=path; }   // nombre del archivo + CARPETA: carga/guarda las etiquetas JUNTO al audio
-    A.enh=enhance_asinh(A.spec,0.07); A.dets.clear();   // NO auto-etiquetar al cargar (lo hace el boton Auto)
+    A.enh=enhance_asinh(A.spec,0.07); A.dets.clear(); invalidate_dets_caches();  // NO auto-etiquetar al cargar (lo hace el boton Auto)
     A.hilos.clear(); A.sel=-1; A.sc0=A.sc1=A.sr0=A.sr1=-1; A.cursor_col=0; A.polyX.clear(); A.polyY.clear(); A.cutX.clear(); A.cutY.clear(); A.selDet=A.selVert=-1; A.selVerts.clear(); A.rbDrag=false;
     A.listSel.clear(); A.listCursor=A.listAnchor=-1; A.listScroll=0;   // lista de etiquetas: reset
-    A.vr0=0; A.vr1=A.spec.H; A.sigInit=false; A.dirty=false; A.undo.clear();   // ventana freq completa + base de autosave + limpia historial
+    A.vr0=0; A.vr1=A.spec.H; A.sigInit=false; A.dirty=false; A.undo.clear(); A.redo.clear(); A.eraserSnapshot.clear();   // ventana freq completa + base de autosave + limpia historial
     A.vc0=0; A.vc1=A.spec.W;                                   // ventana = todo el audio
     // al cargar un audio NUEVO: reinicia TODOS los filtros a su valor por defecto y vuelve a la vista 2D
     A.fLo=0.f; A.fHi=1.f; A.dbMin=0.f; A.dbMax=1.f;            // filtros GLOBALES (freq + dB) a default
     A.volFLo=0.f; A.volFHi=1.f; A.volDbMin=0.f; A.volDbMax=1.f; // filtros LOCALES de la vista Volumen a default
     A.gain=1.0f; A.view=1; layout_botones();                   // ganancia normal + vista Espectro 2D + relayout de botones
+    eraser_init();                                              // inicializar mascara del borrador
     double dur=A.sr?(double)A.audio.samples.size()/A.sr:0;     // eje X segun duracion
     A.tlen=(float)max(2.5,min(14.0,dur*0.7)); A.crosslen=1.7f;  // tiempo largo, freq/dB mas grandes
     A.ax[0]=A.tlen; A.ax[1]=A.ax[2]=A.crosslen;                 // escalas iniciales del cubo (editables con manijas)
@@ -350,8 +456,12 @@ static bool load_audio(const std::string& path){ try{
     { std::string stem=A.fname; size_t dp=stem.find_last_of('.'); if(dp!=std::string::npos)stem=stem.substr(0,dp);
       std::string jp=A.out_dir+"/"+stem+".json"; std::ifstream tf(jp.c_str());
       if(tf.good()){ tf.close(); std::vector<Det> in=import_coco(jp,A.classes);
-        if(!in.empty()){ A.dets=in; if(A.clase_activa>=(int)A.classes.size())A.clase_activa=0; layout_botones();
+        if(!in.empty()){ A.dets=in; if(A.clase_activa>=(int)A.classes.size())A.clase_activa=0; layout_botones(); invalidate_dets_caches();
           std::cout<<"Etiquetas cargadas de "<<jp<<": "<<in.size()<<"\n"; } } }
+    // auto-cargar mascara guardada: si en out_dir existe <nombre_audio>_mask.bmp, cargarla
+    { std::string stem=A.fname; size_t dp=stem.find_last_of('.'); if(dp!=std::string::npos)stem=stem.substr(0,dp);
+      std::string mp=A.out_dir+"/"+stem+"_mask.bmp"; std::ifstream mf(mp.c_str());
+      if(mf.good()){ mf.close(); load_mask_from_path(mp); } }
     // LIMPIEZA DEFENSIVA: descarta anillos mal ubicados (centroide FUERA del exterior) -> artefactos
     // del bug viejo de coords (anillos en la esquina sup-izq, fuera de su etiqueta). Tambien quita huecos degenerados.
     { int removed=0; for(auto&d:A.dets){ if(d.kind!=KIND_POLY||d.px.size()<3){ d.hx.clear(); d.hy.clear(); continue; }
@@ -363,6 +473,36 @@ static bool load_audio(const std::string& path){ try{
     A.lastSig=labels_sig(); A.sigInit=true;   // base del autosave = estado recien cargado
     std::cout<<"Cargado "<<path<<": "<<A.spec.W<<"x"<<A.spec.H<<", "<<A.dets.size()<<" det, "<<A.rios.size()<<" crestas\n";
     return true;}catch(const std::exception&e){std::cerr<<"Error: "<<e.what()<<"\n";return false;} }
+// Cierra el audio actual y resetea toda la estado a "sin archivo".
+// La ventana permanece abierta para poder abrir otro WAV.
+static void close_audio(){
+    PLAYER.stop();
+    if(A.dirty&&A.spec.W>0&&A.fname!="(sin archivo)") guardar(true);   // auto-guardar antes de cerrar
+    A.audio=AudioData(); A.sr=0;
+    A.spec=Img(); A.enh=Img();
+    A.dets.clear(); A.hilos.clear(); A.rios.clear(); A.picos.clear();
+    A.envMin.clear(); A.envMax.clear();
+    A.fname="(sin archivo)"; A.dirty=false;
+    A.undo.clear(); A.redo.clear(); A.undoKind.clear(); A.redoKind.clear();
+    A.eraserUndo.clear(); A.eraserRedo.clear(); A.eraserSnapshot.clear(); A.eraserMask.clear();
+    A.labelMask.clear(); A.maskDirty=true;
+    A.cachedListOrder.clear(); A.listOrderDirty=true;
+    A.listSelBitmap.clear(); A.listSelDirty=true;
+    A.listSel.clear(); A.listCursor=A.listAnchor=-1; A.listScroll=0;
+    A.sc0=A.sc1=A.sr0=A.sr1=-1; A.cursor_col=0;
+    A.polyX.clear(); A.polyY.clear(); A.cutX.clear(); A.cutY.clear();
+    A.selDet=A.selVert=-1; A.selVerts.clear(); A.sel=-1;
+    A.vr0=0; A.vr1=0; A.vc0=0; A.vc1=0;
+    A.sigInit=false;
+    invalidate_dets_caches();
+    // subir textura vacia (pantalla negra)
+    RGBImg blank(1,1);
+    if(!A.tex)glGenTextures(1,&A.tex);
+    glBindTexture(GL_TEXTURE_2D,A.tex); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR); glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGB,1,1,0,GL_RGB,GL_UNSIGNED_BYTE,blank.d.data());
+    std::cout<<"Audio cerrado.\n";
+}
 // RESOLUCION GLOBAL (botones/teclas Res- y Res+): recalcula el espectrograma con un HOP
 // distinto (resolucion TEMPORAL). dir>0 = MAS fino (hop menor -> mas columnas); dir<0 = MAS
 // grueso. Afecta la vista 2D (textura) Y todas las vistas 3D (derivan de A.enh). Reescala las
@@ -388,7 +528,7 @@ static void set_resolution(int dir){
     A.cursor_col=(int)(A.cursor_col*rx+0.5);
     A.vc0=max(0,min(newW-1,(int)(A.vc0*rx+0.5))); A.vc1=max(A.vc0+1,min(newW,(int)(A.vc1*rx+0.5)));   // REESCALA la ventana de tiempo por rx (CONSERVA la region visible; NO resetea)
     A.vr0=max(0,min(A.spec.H-1,A.vr0)); A.vr1=max(A.vr0+1,min(A.spec.H,A.vr1>0?A.vr1:A.spec.H));      // freq (vr): H sin cambio -> se conserva el zoom de frecuencia (clamp defensivo)
-    build_rios(); build_picos(); upload_texture(); A.dirty=true;
+    build_rios(); build_picos(); eraser_init(); upload_texture(); A.dirty=true;
     std::cout<<"Resolucion: hop="<<newHop<<" -> "<<newW<<" columnas (res3d="<<A.res3d<<")\n"; }
 static bool open_dialog(){
     if(g_dialogOpen){ if(g_hwnd)SetForegroundWindow(g_hwnd); return false; }   // ya hay un dialogo abierto -> traer al frente, NO abrir otro
@@ -399,11 +539,44 @@ static bool open_dialog(){
     bool ok=GetOpenFileNameA(&o)!=0; g_dialogOpen=false;
     return ok ? load_audio(f) : false; }
 
+// ---------------- mascara espacial de etiquetas (para play_filtered O(1)) ----------
+// Construye una mascara W×H que marca que pixeles estan dentro de alguna etiqueta.
+// Se cachea y solo se reconstruye cuando A.maskDirty=true.
+static void build_label_mask() {
+    int W = A.spec.W, H = A.spec.H;
+    A.labelMask.assign((size_t)W * H, 0);
+    for (const Det& d : A.dets) {
+        if (d.kind == KIND_POLY && d.px.size() >= 3) {
+            // Rellenar poligono con scanline (simplificado: marcar bounding box y pt_in_det)
+            int x0 = max(0, d.x), x1 = min(W, d.x + d.w);
+            int y0 = max(0, d.y), y1 = min(H, d.y + d.h);
+            for (int r = y0; r < y1; ++r)
+                for (int c = x0; c < x1; ++c)
+                    if (pt_in_det(d, c + 0.5f, r + 0.5f))
+                        A.labelMask[r * W + c] = 1;
+        } else {
+            // Bounding box: marcar rectangulo
+            int x0 = max(0, d.x), x1 = min(W, d.x + d.w);
+            int y0 = max(0, d.y), y1 = min(H, d.y + d.h);
+            for (int r = y0; r < y1; ++r)
+                for (int c = x0; c < x1; ++c)
+                    A.labelMask[r * W + c] = 1;
+        }
+    }
+    A.maskDirty = false;
+}
+inline bool in_label_mask(int c, int r) {
+    int W = A.spec.W, H = A.spec.H;
+    if (c < 0 || c >= W || r < 0 || r >= H) return false;
+    return A.labelMask[r * W + c] != 0;
+}
+
 // ---------------- reproduccion con filtros aplicados al SONIDO ----------
 // STFT enmascarada (mismo criterio que el display: pass_filt sobre freq+dB) +
 // banda de la seleccion (si solo_banda) -> reconstruccion overlap-add (WOLA).
 static void play_filtered(int c0,int c1,bool useSel,float selLo,float selHi){
     const auto& s=A.audio.samples; if(s.empty())return;
+    if(A.maskDirty) build_label_mask();  // reconstruir mascara si hubo cambios en A.dets
     int W=A.spec.W,H=A.spec.H, nfft=A.P.nfft, hop=A.P.hop;
     c0=max(0,min(W-1,c0)); c1=max(c0+1,min(W,c1));
     size_t i0=(size_t)c0*hop, i1=min(s.size(),(size_t)c1*hop+nfft); if(i1<=i0)return;
@@ -431,10 +604,7 @@ static void play_filtered(int c0,int c1,bool useSel,float selLo,float selHi){
             for(int k=0;k<nfft;++k){ int b=(k<=nfft/2)?k:(nfft-k); float f=(float)b/(H-1);
                 int r=(H-1)-b; if(r<0)r=0; if(r>=H)r=H-1; float e=A.enh.at(r,cc);
                 bool keep=(f>=qfLo&&f<=qfHi&&e>=qdLo&&e<=qdHi); if(useSel&&(f<selLo||f>selHi))keep=false;
-                if(keep&&useMask){ bool in=false;       // ¿(cc,r) cae dentro de alguna etiqueta (fuera de sus huecos)?
-                    for(const Det&d:A.dets){ if(cc<d.x||cc>=d.x+d.w||r<d.y||r>=d.y+d.h)continue;
-                        if(pt_in_det(d,cc+0.5f,r+0.5f)){in=true;break;} }
-                    if(!in)keep=false; }
+                if(keep&&useMask){ if(!in_label_mask(cc,r)) keep=false; }
                 if(!keep) X[k]=Cf(0,0); }
             ifft(X);
             size_t base=off-i0;
@@ -478,7 +648,7 @@ static void layout_botones(){
     struct Bdef{ const char* label; int key; int icon; int when; const char* tip; };  // when: 0=siempre, else vista
     static const Bdef defs[]={
         // --- Archivo ---
-        {"",'o',0,0,"Abrir archivo WAV"},{"Cargar",'R',-1,0,"Cargar etiquetas Raven (.txt selection table)"},{"",'s',7,0,"Guardar (COCO .json + Raven .txt)"},
+        {"",'o',0,0,"Abrir archivo WAV"},        {"Cargar",'R',-1,0,"Cargar etiquetas Raven (.txt) o mascara de fondo (_mask.bmp)"},{"",'s',7,0,"Guardar (COCO .json + Raven .txt)"},
         {0,0,0,0,0},
         // --- Vistas ---
         {"2D",'1',-1,0,"Vista espectrograma 2D"},{"3D",'2',-1,0,"Vista terreno 3D"},
@@ -504,16 +674,21 @@ static void layout_botones(){
         {"BBox",'Y',-1,0,"Etiquetar BOUNDING BOX (arrastra un rectangulo)"},
         {"Poly",'P',-1,0,"Etiquetar POLIGONO (clic a clic; clic-der/Enter cierra)"},
         {"Cortar",'X',-1,0,"Corte LIBRE: pinta el trazo y clic-derecho corta TODAS las etiquetas que cruza"},
+        {"Unir",'J',-1,0,"Unir dos etiquetas: clic en la primera, luego en la segunda"},
+        {"Borrar",'d',-1,0,"Borrar residuos: pinta areas para excluir del autoetiquetado (radio adjustable con rueda)"},
         {"Auto",'a',-1,0,"Auto-etiquetar SOBRE EL FILTRO, con la forma activa (poligono o bbox)"},
         {"+Etiq",'N',-1,0,"Crear etiqueta nueva (escribe el nombre)"},
         {"Ocultar",'O',-1,0,"Ocultar / mostrar las etiquetas"},
         {"Lista",'L',-1,0,"Lista de TODAS las etiquetas: clic=selecciona (resalta en 2D); cabecera ordena por tamano; Supr/clic-der borra; Ctrl/Shift/flechas = multiseleccion"},
         {"Limpiar",'c',-1,0,"Borrar TODAS las etiquetas"},
+        {"Masc",'K',-1,0,"Exportar mascara de fondo (BMP: blanco=fondo, negro=senal). Muestra animacion de carga"},
+        {"Afinar",'F',-1,0,"Afinar espectrograma: elimina residuos con opening morfológico (se resalta si esta activo)"},
+        {"VerMask",'h',-1,0,"Mostrar / ocultar la mascara del borrador (se resalta si esta activa)"},
         {0,0,0,0,0},
         // --- 3D ---
         {"Res-",'[',-1,0,"Menos resolucion (toda vista: recalcula espectro + 3D)"},{"Res+",']',-1,0,"Mas resolucion (toda vista: recalcula espectro + 3D)"},
         {"Crestas",'H',-1,3,"Crestas completas: muestra el hilo entero si algun punto pasa el filtro"},  // solo vista Rio (V3)
-        {"Glifos",'G',-1,6,"Glifos completos: dibuja todos los palos del hilo si algun punto pasa el filtro"}, // solo Quiver (V6)
+        {"Glifos",'Q',-1,6,"Glifos completos: dibuja todos los palos del hilo si algun punto pasa el filtro"}, // solo Quiver (V6)
         {0,0,0,0,0},
         // --- Info ---
         {"Acerca",'?',-1,0,"Acerca de / Contacto: creador, IIAP, y para que sirve el software"},
@@ -565,8 +740,10 @@ static void show_busy(const std::string& msg){ if(!g_hdc)return;
     SwapBuffers(g_hdc); }
 // espectro restringido al filtro actual (freq+dB): para auto-segmentar SOLO lo visible
 static Img filtered_spec(){ Img s=A.spec; int W=A.spec.W,H=A.spec.H;
+    bool hasMask=!A.eraserMask.empty() && A.show_mask;
     for(int r=0;r<H;++r){ float f=(float)(H-1-r)/(H-1);
-        for(int c=0;c<W;++c){ float e=A.enh.at(r,c); if(!pass_filt(f,e)) s.at(r,c)=0.f; } }
+        for(int c=0;c<W;++c){ float e=A.enh.at(r,c);
+            if(!pass_filt(f,e)||(hasMask&&A.eraserMask[r*W+c])) s.at(r,c)=0.f; } }
     return s; }
 // Auto-etiquetar: detecta sobre el espectro FILTRADO; si el filtro deja todo vacio,
 // reintenta sobre el espectro completo para que SIEMPRE proponga algo. Muestra etiquetas.
@@ -574,7 +751,7 @@ static void auto_segment(){ if(A.spec.W<1)return;
     show_busy("Auto-etiquetando..."); push_undo();
     std::vector<Det> d=auto_label(filtered_spec(),A.K,A.area_min,A.shape_poly,A.shape_poly?A.autoBuffer:0);   // sin limite de ancho: puede etiquetar areas grandes (bandas que cruzan toda la grabacion)
     if(d.empty()) d=auto_label(A.spec,A.K,A.area_min,A.shape_poly,A.shape_poly?A.autoBuffer:0);  // respaldo: espectro crudo
-    A.dets=std::move(d); A.sel=-1; A.hide_labels=false; A.listSel.clear();       // asegurar que se vean
+    A.dets=std::move(d); A.sel=-1; A.hide_labels=false; A.listSel.clear(); invalidate_dets_caches();      // asegurar que se vean
     std::cout<<"Auto-etiquetado: "<<A.dets.size()<<" etiquetas\n"; }
 // Auto-etiquetar SOLO dentro del rectangulo de seleccion [sc0,sc1]x[sr0,sr1], sobre el
 // espectro FILTRADO (respeta fLo/fHi/dbMin/dbMax). AGREGA las etiquetas (no reemplaza) y
@@ -594,7 +771,7 @@ static void auto_segment_in_selection(bool make_poly){ if(A.spec.W<1)return;
         for(size_t k=0;k<det.px.size();++k){ det.px[k]+=c0; det.py[k]+=r0; }
         for(auto&hxv:det.hx)for(auto&v:hxv)v+=c0; for(auto&hyv:det.hy)for(auto&v:hyv)v+=r0;   // FIX: offsetear TAMBIEN los anillos/huecos (antes quedaban en coords del recorte -> aparecian en la esquina sup-izq, fuera de la etiqueta)
         A.dets.push_back(std::move(det)); }
-    A.sel=(int)A.dets.size()-1; A.hide_labels=false; A.dirty=true;
+    A.sel=(int)A.dets.size()-1; A.hide_labels=false; A.dirty=true; invalidate_dets_caches();
     std::cout<<"Auto-etiquetado seleccion: "<<d.size()<<" etiquetas\n"; }
 // Auto-mejorar una etiqueta: re-segmenta SOLO su region (con un margen) sobre el
 // espectro filtrado y reemplaza el poligono por el contorno hallado (conserva clase).
@@ -609,13 +786,79 @@ static void improve_det(int i){ if(i<0||i>=(int)A.dets.size())return; int W=A.sp
     int best=0; long ba=0; for(size_t k=0;k<ds.size();++k){ long a=(long)ds[k].w*ds[k].h; if(a>ba){ba=a;best=(int)k;} }
     Det nd=ds[best]; for(size_t k=0;k<nd.px.size();++k){ nd.px[k]+=x0; nd.py[k]+=y0; }   // offset a coords globales
     for(auto&hxv:nd.hx)for(auto&v:hxv)v+=x0; for(auto&hyv:nd.hy)for(auto&v:hyv)v+=y0;   // FIX: offsetear TAMBIEN los anillos/huecos al global
-    nd.x+=x0; nd.y+=y0; nd.cls=d.cls; nd.kind=KIND_POLY; d=nd; }
+    nd.x+=x0; nd.y+=y0; nd.cls=d.cls; nd.kind=KIND_POLY; d=nd; invalidate_dets_caches(); }
 // modal de buffer: fija autoBuffer desde la posicion del raton y re-mejora la etiqueta
 // (siempre desde la copia original, para que el slider no acumule).
 static void buffer_apply(int mx){ float tx0,tx1,ty; bufslider(tx0,tx1,ty);
     float v=(mx-tx0)/(tx1-tx0>1?tx1-tx0:1); v=v<0?0:(v>1?1:v);
     A.autoBuffer=(int)(v*BUF_MAX+0.5f);
-    if(A.bufSel>=0&&A.bufSel<(int)A.dets.size()){ A.dets[A.bufSel]=A.bufOrig; improve_det(A.bufSel); } }
+    if(A.bufSel>=0&&A.bufSel<(int)A.dets.size()){ A.dets[A.bufSel]=A.bufOrig; improve_det(A.bufSel); invalidate_dets_caches(); } }
+
+// --- refinamiento: slider y aplicar ---
+static const int REFINE_MAX = 8;   // radio maximo del opening
+static void refine_slider(float& tx0,float& tx1,float& ty){ float w=400,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-45;
+    tx0=x+24; tx1=x+w-24; ty=y+56; }
+static void refine_density_slider(float& tx0,float& tx1,float& ty){ float w=400,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-45;
+    tx0=x+24; tx1=x+w-24; ty=y+76; }
+static void apply_refine(){
+    if(A.spec.W<1) return;
+    int W=A.spec.W, H=A.spec.H;
+    int c0=A.vc0, c1=A.vc1; if(c1<=c0){c0=0; c1=W;}
+    int r0=A.vr0, r1=A.vr1; if(r1<=r0){r0=0; r1=H;}
+    int rw=c1-c0, rh=r1-r0; if(rw<3||rh<3) return;
+    // 1. Crear máscara binaria de la región visible: 1=señal (pasa filtro), 0=fondo
+    Mask vis((size_t)rw*rh, 0);
+    bool hasMask=!A.eraserMask.empty();
+    for(int r=r0;r<r1;++r){ float f=(float)(H-1-r)/(H-1);
+        for(int c=c0;c<c1;++c){ float e=A.enh.at(r,c);
+            if(pass_filt(f,e) && (!hasMask||A.eraserMask[r*W+c]==0))
+                vis[(size_t)(r-r0)*rw+(c-c0)] = 1; } }
+    // 2. Filtro de densidad: para cada píxel, contar píxeles activos en una ventana
+    //    amplia (2*rad+1). Si la densidad (activos/total) < refineDensity, eliminar.
+    //    Esto quita bloques de ruido que están cerca de la forma pero no son parte de ella.
+    int rad = A.refineRadius;
+    int minN = max(1, rad);
+    int cleanRad = max(rad, 3);   // ventana para densidad: al menos 3 para tener sentido
+    float densityThr = A.refineDensity;
+    int cleaned = 0;
+    if(hasMask || A.eraserMask.empty()) A.eraserMask.resize((size_t)W*H);
+    for(int rr=0;rr<rh;++rr){
+        for(int cc=0;cc<rw;++cc){
+            if(vis[rr*rw+cc]==0) continue;
+            // Filtro 1: conteo de vecinos (aislamiento)
+            int cnt=0;
+            for(int dr=-rad;dr<=rad&&cnt<minN;++dr){
+                for(int dc=-rad;dc<=rad&&cnt<minN;++dc){
+                    if(dr==0&&dc==0) continue;
+                    int nr=rr+dr, nc=cc+dc;
+                    if(nr>=0&&nr<rh&&nc>=0&&nc<rw&&vis[nr*rw+nc]) ++cnt;
+                }
+            }
+            if(cnt<minN){  // muy pocas señales vecinas → residuo aislado
+                int gr=r0+rr, gc=c0+cc;
+                if(A.eraserMask[gr*W+gc]==0){ A.eraserMask[gr*W+gc]=1; ++cleaned; }
+                continue;
+            }
+            // Filtro 2: densidad en ventana amplia
+            int total=0, active=0;
+            for(int dr=-cleanRad;dr<=cleanRad;++dr){
+                for(int dc=-cleanRad;dc<=cleanRad;++dc){
+                    int nr=rr+dr, nc=cc+dc;
+                    if(nr>=0&&nr<rh&&nc>=0&&nc<rw){
+                        ++total;
+                        if(vis[nr*rw+nc]) ++active;
+                    }
+                }
+            }
+            if(total>0 && (float)active/(float)total < densityThr){
+                int gr=r0+rr, gc=c0+cc;
+                if(A.eraserMask[gr*W+gc]==0){ A.eraserMask[gr*W+gc]=1; ++cleaned; }
+            }
+        }
+    }
+    A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+    upload_texture(); push_eraser_undo();
+    std::cout<<"Afinado: "<<cleaned<<" residuos eliminados (radio="<<A.refineRadius<<", minVecinos="<<minN<<", densidad="<<densityThr<<")\n"; }
 
 static void draw_tex_quad(float x0,float y0,float x1,float y1,float u0=0.f,float u1=1.f,float v0=0.f,float v1=1.f){
     glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,A.tex); glColor3f(1,1,1);
@@ -628,6 +871,7 @@ static void draw_tex_quad(float x0,float y0,float x1,float y1,float u0=0.f,float
 struct FillSeg{ float c0,r0,c1,r1; };           // arista en coords de ESPECTRO (col,fila)
 static std::vector<FillSeg> g_fillSeg;
 static std::vector<float> g_fillX;
+static void draw_rios_2d(float x0,float y0,float x1,float y1,int cLo,int cHi,int rLo,int rHi);  // fwd
 static void draw_overlays(float x0,float y0,float x1,float y1,bool conHilos,int cLo,int cHi,int rLo=0,int rHi=0){
     int H=A.spec.H; if(rHi<=rLo)rHi=H; int span=max(1,cHi-cLo),rspan=max(1,rHi-rLo); float sx=(x1-x0)/span, sy=(y1-y0)/rspan;
     auto xc=[&](float c){ float x=x0+(c-cLo)*sx; return x<x0?x0:(x>x1?x1:x); };
@@ -1025,10 +1269,13 @@ static void render_toolbar(){ ortho2d();
         if(b.key=='1'+A.view-1)on=true; if(b.key=='B'&&A.solo_banda)on=true;
         if(b.key=='k'&&PLAYER.paused)on=true;
         if(b.key=='H'&&A.rio_completo)on=true;
-        if(b.key=='G'&&A.quiver_completo)on=true;
+        if(b.key=='Q'&&A.quiver_completo)on=true;
         if(b.key=='S'&&A.tool==T_SELECT)on=true;
         if(b.key=='Y'&&A.tool==T_BBOX)on=true; if(b.key=='P'&&A.tool==T_POLY)on=true;
-        if(b.key=='X'&&A.tool==T_CUT)on=true; if(b.key=='O'&&A.hide_labels)on=true; if(b.key=='L'&&A.listOpen)on=true;
+        if(b.key=='X'&&A.tool==T_CUT)on=true; if(b.key=='J'&&A.tool==T_MERGE)on=true; if(b.key=='d'&&A.tool==T_ERASER)on=true;
+        if(b.key=='h'&&A.show_mask)on=true;
+        if(b.key=='F'&&A.refining)on=true;
+        if(b.key=='O'&&A.hide_labels)on=true; if(b.key=='L'&&A.listOpen)on=true;
         if(on)glColor3f(0.25f,0.45f,0.65f);else glColor3f(0.20f,0.20f,0.24f);
         glBegin(GL_QUADS);glVertex2f(b.x,b.y);glVertex2f(b.x+b.w,b.y);glVertex2f(b.x+b.w,b.y+b.h);glVertex2f(b.x,b.y+b.h);glEnd();
         glColor3f(0.5f,0.5f,0.55f);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(b.x,b.y);glVertex2f(b.x+b.w,b.y);glVertex2f(b.x+b.w,b.y+b.h);glVertex2f(b.x,b.y+b.h);glEnd();
@@ -1048,16 +1295,20 @@ static void render_toolbar(){ ortho2d();
 static void render_hud(){ ortho2d(); glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
     glColor4f(0,0,0,0.6f);glBegin(GL_QUADS);glVertex2f(0,0);glVertex2f(A.cW,0);glVertex2f(A.cW,HUD_H);glVertex2f(0,HUD_H);glEnd();glDisable(GL_BLEND);
     const char* vn[]={"","Espectro2D","Terreno3D","RioEspectral","NubePuntos","CascadaEspectral","Quiver3D","Volumen"};
-    const char* tn[]={"Selec","BBox","Poligono","Editar","Cortar"};
+    const char* tn[]={"Selec","BBox","Poligono","Editar","Cortar","Unir","Borrador"};
     std::string s=std::string("IIAP SachaAcoustic | ")+A.fname+" | V"+std::to_string(A.view)+":"+vn[A.view]+
         "  etiq="+std::to_string(A.dets.size())+"  clase="+class_name(A.clase_activa)+"  tool="+tn[A.tool]+
         (A.tool==T_POLY?"(a mano)":"")+
+        (A.tool==T_ERASER?std::string(" r=")+std::to_string(A.eraserRadius):"")+
         "  play="+(A.solo_banda?"banda(t+f)":"toda-freq(t)")+(PLAYER.paused?"  [PAUSA]":"");
     { char vb[24]; snprintf(vb,24,"  vel=%.1fx",A.playSpeed); s+=vb; }   // velocidad de reproduccion
     if(A.view>=2){const int*p=PERM[A.axperm];s+=std::string("  ejes X=")+DIMN[p[0]]+" Y="+DIMN[p[1]]+" Z="+DIMN[p[2]]+"  res3d="+std::to_string(A.res3d);}
+    if(A.view==3||A.view==6){ s+=std::string("  crestas=")+std::to_string(A.rios.size()); }
     if(A.spec.W>0){ double ny=A.sr*0.5,dr=A.P.dyn_range_db; char fb[120];
         snprintf(fb,120,"  filtro f=%.0f-%.0fHz dB=%.0f..%.0f",A.fLo*ny,A.fHi*ny,(A.dbMin-1)*dr,(A.dbMax-1)*dr); s+=fb; }
-    glColor3f(1,1,1); FONT.at2d(6,14,s); }
+    glColor3f(1,1,1); FONT.at2d(6,14,s);
+    if((A.view==3||A.view==6)&&A.rios.empty()&&A.spec.W>0){
+        ortho2d(); glColor3f(1.f,0.7f,0.3f); FONT.at2d(A.cW/2-120,A.cH/2,"(0 crestas detectadas - ajusta el filtro o la resolucion)"); } }
 // Lectura EN VIVO de lo que apunta el cursor: tiempo (s), frecuencia (Hz/kHz) y nivel (dB).
 // Se dibuja arriba a la derecha (sobre el HUD) solo si el cursor esta sobre un espectrograma:
 // el plot 2D principal (vista 1) o la tira inferior (cualquier vista). dB = (enh-1)*rango, el
@@ -1108,12 +1359,28 @@ static void render_cmap_dropdown(){ if(!A.cmapOpen)return; float x,y,w,h; cmap_l
 static const int LIST_W = 300, LIST_HH = 22, LIST_RH = 16;   // ancho panel, alto cabecera, alto fila
 static void list_rect(float&x,float&y,float&w,float&h){ w=(float)LIST_W; x=(float)(A.cW-LIST_W); y=(float)main_y0();
     h=(float)(panel_y0()-main_y0()); if(h<60)h=60; }
-static std::vector<int> list_order(){ std::vector<int> idx; idx.reserve(A.dets.size());   // orden de display (por id o por tamano)
-    for(int i=0;i<(int)A.dets.size();++i)idx.push_back(i);
-    if(A.listSortSize) std::stable_sort(idx.begin(),idx.end(),
-        [](int a,int b){ return (long long)A.dets[a].w*A.dets[a].h > (long long)A.dets[b].w*A.dets[b].h; });   // mayor area primero
-    return idx; }
-static bool list_is_sel(int i){ for(int s:A.listSel) if(s==i)return true; return false; }
+// Cache: solo recalcula cuando listOrderDirty=true.
+static std::vector<int> list_order() {
+    if (A.listOrderDirty) {
+        A.cachedListOrder.resize(A.dets.size());
+        for (int i = 0; i < (int)A.dets.size(); ++i) A.cachedListOrder[i] = i;
+        if (A.listSortSize) std::stable_sort(A.cachedListOrder.begin(), A.cachedListOrder.end(),
+            [](int a, int b) { return (long long)A.dets[a].w * A.dets[a].h > (long long)A.dets[b].w * A.dets[b].h; });
+        A.listOrderDirty = false;
+    }
+    return A.cachedListOrder;
+}
+// Bitmap: reconstruccion lazy cuando listSelDirty=true. Lookup O(1).
+static void rebuild_list_sel_bitmap() {
+    A.listSelBitmap.assign(A.dets.size(), false);
+    for (int s : A.listSel) if (s >= 0 && s < (int)A.dets.size()) A.listSelBitmap[s] = true;
+    A.listSelDirty = false;
+}
+static bool list_is_sel(int i) {
+    if (A.listSelDirty) rebuild_list_sel_bitmap();
+    if (i < 0 || i >= (int)A.listSelBitmap.size()) return false;
+    return A.listSelBitmap[i];
+}
 static void list_toggle(int i){ for(size_t k=0;k<A.listSel.size();++k) if(A.listSel[k]==i){ A.listSel.erase(A.listSel.begin()+(long)k); return; } A.listSel.push_back(i); }
 static void list_select_range(int a,int b){ if(a>b){int t=a;a=b;b=t;} auto order=list_order(); A.listSel.clear();
     for(int r=a;r<=b&&r<(int)order.size();++r) if(r>=0)A.listSel.push_back(order[r]); }
@@ -1153,22 +1420,26 @@ static int list_delete_selected(){ if(A.listSel.empty())return 0; push_undo();  
     std::vector<int> idx=A.listSel; std::sort(idx.begin(),idx.end()); idx.erase(std::unique(idx.begin(),idx.end()),idx.end());
     for(int i=(int)idx.size()-1;i>=0;--i){ if(idx[i]>=0&&idx[i]<(int)A.dets.size())A.dets.erase(A.dets.begin()+idx[i]); }   // descendente: no invalida indices menores
     int k=(int)idx.size(); A.listSel.clear(); A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear();
-    if(A.listCursor>=(int)A.dets.size())A.listCursor=(int)A.dets.size()-1; A.listAnchor=-1; A.dirty=true; return k; }
+    if(A.listCursor>=(int)A.dets.size())A.listCursor=(int)A.dets.size()-1; A.listAnchor=-1; A.dirty=true; invalidate_dets_caches(); return k; }
 
 // Crestas del rio dibujadas SOBRE el espectrograma 2D, con el mismo filtro
 // (hilos completos o corte por vertice). Refleja el filtro de hilos en 2D.
-static void draw_rios_2d(float X0,float Y0,float X1,float Y1){
-    int W=A.spec.W,H=A.spec.H; if(W<2)return; float sx=(X1-X0)/W, sy=(Y1-Y0)/H;
+// Recibe la ventana visible (cLo..cHi columnas, rLo..rHi filas) para mapear correctamente.
+static void draw_rios_2d(float x0,float y0,float x1,float y1,int cLo,int cHi,int rLo,int rHi){
+    int H=A.spec.H; if(H<2||A.rios.empty())return;
+    int span=max(1,cHi-cLo),rspan=max(1,rHi-rLo); float sx=(x1-x0)/span, sy=(y1-y0)/rspan;
+    auto xc=[&](float c){ float x=x0+(c-(float)cLo)*sx; return x<x0?x0:(x>x1?x1:x); };
+    auto yc=[&](float r){ float y=y0+(r-(float)rLo)*sy; return y<y0?y0:(y>y1?y1:y); };
     glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA); glLineWidth(1.6f); glColor4f(0.2f,1.f,1.f,0.9f);
     for(auto&h:A.rios){
         if(A.rio_completo){ bool any=false;
             for(size_t k=0;k<h.col.size();++k){ float f=(float)(H-1-h.row[k])/(H-1),e=A.enh.at(h.row[k],h.col[k]); if(pass_filt(f,e)){any=true;break;} }
             if(!any)continue; glBegin(GL_LINE_STRIP);
-            for(size_t k=0;k<h.col.size();++k) glVertex2f(X0+h.col[k]*sx,Y0+h.row[k]*sy); glEnd();
+            for(size_t k=0;k<h.col.size();++k) glVertex2f(xc((float)h.col[k]),yc((float)h.row[k])); glEnd();
         } else { bool pen=false;
             for(size_t k=0;k<h.col.size();++k){ float f=(float)(H-1-h.row[k])/(H-1),e=A.enh.at(h.row[k],h.col[k]);
                 if(!pass_filt(f,e)){ if(pen){glEnd();pen=false;} continue; }
-                if(!pen){glBegin(GL_LINE_STRIP);pen=true;} glVertex2f(X0+h.col[k]*sx,Y0+h.row[k]*sy); }
+                if(!pen){glBegin(GL_LINE_STRIP);pen=true;} glVertex2f(xc((float)h.col[k]),yc((float)h.row[k])); }
             if(pen)glEnd();
         }
     }
@@ -1248,6 +1519,23 @@ static void render_naming(){ if(!A.naming)return; ortho2d();
     glColor3f(1,1,1);FONT.at2d(x+10,y+18,"Nueva etiqueta (Enter=ok, Esc=cancela):");
     FONT.at2d(x+10,y+42,A.nameBuf+"_"); }
 
+// overlay de confirmacion al arrastrar una mascara BMP que no coincide con el audio
+static void render_mask_prompt(){ if(!A.maskPromptOpen)return; ortho2d();
+    float w=480,hh=100,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-hh*0.5f;
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);glColor4f(0,0,0,0.92f);
+    glBegin(GL_QUADS);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+hh);glVertex2f(x,y+hh);glEnd();glDisable(GL_BLEND);
+    glColor3f(0.9f,0.6f,0.3f);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+hh);glVertex2f(x,y+hh);glEnd();
+    glColor3f(1,1,1);FONT.at2d(x+14,y+20,"La mascara no pertenece al audio abierto.");
+    FONT.at2d(x+14,y+40,"Desea abrirla de todas formas?");
+    // boton "Abrir"
+    float bx0=x+w*0.5f-130, bx1=bx0+110, by0=y+hh-38, by1=by0+26;
+    glColor4f(0.2f,0.55f,0.3f,0.9f);glEnable(GL_BLEND);glBegin(GL_QUADS);glVertex2f(bx0,by0);glVertex2f(bx1,by0);glVertex2f(bx1,by1);glVertex2f(bx0,by1);glEnd();glDisable(GL_BLEND);
+    glColor3f(1,1,1);FONT.at2d(bx0+30,by0+7,"Abrir");
+    // boton "Cerrar"
+    float cx0=bx1+20, cx1=cx0+110;
+    glColor4f(0.55f,0.2f,0.2f,0.9f);glEnable(GL_BLEND);glBegin(GL_QUADS);glVertex2f(cx0,by0);glVertex2f(cx1,by0);glVertex2f(cx1,by1);glVertex2f(cx0,by1);glEnd();glDisable(GL_BLEND);
+    glColor3f(1,1,1);FONT.at2d(cx0+28,by0+7,"Cerrar"); }
+
 // modal de BUFFER: barra para ajustar el buffer (suavizado) de la etiqueta poligono
 static void render_buffer_modal(){ if(!A.buffering)return; ortho2d();
     float w=400,hh=90,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-45; char b[48];
@@ -1261,6 +1549,31 @@ static void render_buffer_modal(){ if(!A.buffering)return; ortho2d();
     float hx=tx0+(float)A.autoBuffer/BUF_MAX*(tx1-tx0);                                                          // relleno + manija
     glColor3f(0.4f,0.7f,1.f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(tx0,ty);glVertex2f(hx,ty);glEnd();
     glColor3f(1,1,1);glBegin(GL_QUADS);glVertex2f(hx-5,ty-8);glVertex2f(hx+5,ty-8);glVertex2f(hx+5,ty+8);glVertex2f(hx-5,ty+8);glEnd();
+    glDisable(GL_BLEND); }
+
+// modal de refinamiento (opening morfológico)
+static void render_refine_modal(){ if(!A.refining)return; ortho2d();
+    float w=400,hh=110,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-55; char b[64];
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);glColor4f(0,0,0,0.92f);
+    glBegin(GL_QUADS);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+hh);glVertex2f(x,y+hh);glEnd();
+    glColor3f(0.6f,0.8f,1.f);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+hh);glVertex2f(x,y+hh);glEnd();
+    snprintf(b,64,"Afinar: radio = %d  (min %d vecinos)",A.refineRadius,max(1,A.refineRadius));
+    glColor3f(1,1,1); FONT.at2d(x+14,y+16,b);
+    snprintf(b,64,"Densidad minima: %.0f%%",A.refineDensity*100.f);
+    FONT.at2d(x+14,y+36,b);
+    FONT.at2d(x+14,y+hh-8,"Enter=aplica | Esc=cancela");
+    // slider 1: radio
+    float tx0,tx1,ty; refine_slider(tx0,tx1,ty);
+    glColor3f(0.3f,0.3f,0.36f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(tx0,ty);glVertex2f(tx1,ty);glEnd();
+    float hx=tx0+(float)A.refineRadius/REFINE_MAX*(tx1-tx0);
+    glColor3f(0.4f,0.7f,1.f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(tx0,ty);glVertex2f(hx,ty);glEnd();
+    glColor3f(1,1,1);glBegin(GL_QUADS);glVertex2f(hx-5,ty-8);glVertex2f(hx+5,ty-8);glVertex2f(hx+5,ty+8);glVertex2f(hx-5,ty+8);glEnd();
+    // slider 2: densidad
+    float dx0,dx1,dy; refine_density_slider(dx0,dx1,dy);
+    glColor3f(0.3f,0.3f,0.36f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(dx0,dy);glVertex2f(dx1,dy);glEnd();
+    float dhx=dx0+A.refineDensity*(dx1-dx0);
+    glColor3f(0.7f,0.5f,0.3f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(dx0,dy);glVertex2f(dhx,dy);glEnd();
+    glColor3f(1,1,1);glBegin(GL_QUADS);glVertex2f(dhx-5,dy-8);glVertex2f(dhx+5,dy-8);glVertex2f(dhx+5,dy+8);glVertex2f(dhx-5,dy+8);glEnd();
     glDisable(GL_BLEND); }
 
 // panel "Acerca de / Contacto" (clic o Esc para cerrar)
@@ -1344,7 +1657,14 @@ static void render(){ glClearColor(0.04f,0.03f,0.06f,1); glViewport(0,0,A.cW,A.c
             render_axes2d();                                                // ejes 2D (solo vista 2D)
             if(A.dragging&&A.dragRegion==1){glColor3f(1,1,1);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(A.dx0,A.dy0);glVertex2f(A.dx1,A.dy0);glVertex2f(A.dx1,A.dy1);glVertex2f(A.dx0,A.dy1);glEnd();}
             if(A.tool==T_CUT&&A.cutX.size()>=1){ glColor3f(1,0.35f,0.35f);glLineWidth(2.5f);  // trazo de corte libre
-                glBegin(GL_LINE_STRIP);for(size_t k=0;k<A.cutX.size();++k){float sx,sy;spec_to_main((float)A.cutX[k],(float)A.cutY[k],sx,sy);glVertex2f(sx,sy);}glEnd(); } }
+                glBegin(GL_LINE_STRIP);for(size_t k=0;k<A.cutX.size();++k){float sx,sy;spec_to_main((float)A.cutX[k],(float)A.cutY[k],sx,sy);glVertex2f(sx,sy);}glEnd(); }
+            if(A.tool==T_ERASER){ int c,r; main_to_spec(A.mx,A.my,c,r); float sx,sy; spec_to_main((float)c,(float)r,sx,sy);   // cursor circular del borrador
+                float spanX=max(1.f,(plotX1()-plotX0())/(float)max(1,vhi()-vlo()));
+                float spanY=max(1.f,(plotY1()-plotY0())/(float)max(1,rhi()-rlo()));
+                float rx=(float)A.eraserRadius*spanX, ry=(float)A.eraserRadius*spanY;
+                glLineWidth(2.f); glColor4f(1.f,0.3f,0.3f,0.7f); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+                int segs=32; glBegin(GL_LINE_LOOP); for(int i=0;i<segs;++i){ float a=6.2832f*i/segs; glVertex2f(sx+cosf(a)*rx,sy+sinf(a)*ry); } glEnd();
+                glDisable(GL_BLEND); glLineWidth(1.f); } }
         else if(A.view==2) render_terrain3d();
         else if(A.view==3) render_rios3d();
         else if(A.view==4) render_pointcloud();
@@ -1356,13 +1676,33 @@ static void render(){ glClearColor(0.04f,0.03f,0.06f,1); glViewport(0,0,A.cW,A.c
         render_filter_bars();                                               // barras de filtro en TODAS las vistas (V7 = filtros locales)
         if(A.dragging&&(A.dragRegion==2||A.dragRegion==3)){ortho2d();glColor3f(1,1,1);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(A.dx0,A.dy0);glVertex2f(A.dx1,A.dy0);glVertex2f(A.dx1,A.dy1);glVertex2f(A.dx0,A.dy1);glEnd();}
     } else { ortho2d(); glColor3f(1,1,1); FONT.at2d(20,A.cH/2,"Pulsa 'Abrir' (tecla o) o ARRASTRA un WAV aqui para cargarlo..."); }
-    render_toolbar(); render_hud(); render_cursor_readout(); render_label_list(); render_cmap_dropdown(); render_tooltip(); render_naming(); render_buffer_modal(); render_about(); }
+    render_toolbar(); render_hud(); render_cursor_readout(); render_label_list(); render_cmap_dropdown(); render_tooltip(); render_naming(); render_buffer_modal(); render_refine_modal(); render_about(); render_mask_prompt(); }
 
 // ---------------- acciones ----------
 // historial para Ctrl+Z: guarda una instantanea de las etiquetas ANTES de modificarlas.
-static void push_undo(){ A.undo.push_back(A.dets); if(A.undo.size()>50)A.undo.erase(A.undo.begin()); }
-static void do_undo(){ if(A.undo.empty())return; A.dets=A.undo.back(); A.undo.pop_back();
-    A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.listSel.clear(); A.dirty=true; std::cout<<"Deshacer ("<<A.undo.size()<<" restantes)\n"; }
+static void push_undo(){ A.undo.push_back(A.dets); A.undoKind.push_back(A.UNDO_LABELS);
+    if(A.undo.size()>50){ A.undo.erase(A.undo.begin()); A.undoKind.erase(A.undoKind.begin()); }
+    A.redo.clear(); A.redoKind.clear(); A.eraserRedo.clear(); }
+// historial para Ctrl+Z del borrador: guarda la mascara ANTES de pintar.
+static void push_eraser_undo(){ A.undo.push_back(A.dets); A.undoKind.push_back(A.UNDO_ERASER); A.eraserUndo.push_back(A.eraserSnapshot);
+    if(A.undo.size()>50){ A.undo.erase(A.undo.begin()); A.undoKind.erase(A.undoKind.begin()); if(!A.eraserUndo.empty())A.eraserUndo.erase(A.eraserUndo.begin()); }
+    A.redo.clear(); A.redoKind.clear(); A.eraserRedo.clear(); }
+static void do_undo(){
+    if(A.undo.empty())return;
+    A.redo.push_back(A.dets); A.redoKind.push_back(A.undoKind.back());
+    if(A.undoKind.back()==A.UNDO_ERASER){ A.eraserRedo.push_back(A.eraserMask); A.dets=A.undo.back(); A.eraserMask=A.eraserUndo.back(); A.eraserUndo.pop_back(); upload_texture(); }
+    else { A.dets=A.undo.back(); }
+    A.undo.pop_back(); A.undoKind.pop_back();
+    A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.listSel.clear(); A.dirty=true; invalidate_dets_caches();
+    std::cout<<"Deshacer ("<<A.undo.size()<<" deshacer, "<<A.redo.size()<<" rehacer)\n"; }
+static void do_redo(){
+    if(A.redo.empty())return;
+    A.undo.push_back(A.dets); A.undoKind.push_back(A.redoKind.back());
+    if(A.redoKind.back()==A.UNDO_ERASER){ A.eraserUndo.push_back(A.eraserMask); A.dets=A.redo.back(); A.eraserMask=A.eraserRedo.back(); A.eraserRedo.pop_back(); upload_texture(); }
+    else { A.dets=A.redo.back(); }
+    A.redo.pop_back(); A.redoKind.pop_back();
+    A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.listSel.clear(); A.dirty=true; invalidate_dets_caches();
+    std::cout<<"Rehacer ("<<A.undo.size()<<" deshacer, "<<A.redo.size()<<" rehacer)\n"; }
 // Selecciona la etiqueta bajo (c,r). Si hay varias solapadas (p.ej. una PEQUENA dentro de
 // otra GRANDE) elige la de MENOR area, para poder seleccionar/editar la interior. Para
 // poligonos exige que el punto caiga dentro de la forma real (pt_in_poly), no solo del bbox.
@@ -1382,9 +1722,92 @@ static int delete_in_selection(){
         for(int i=(int)A.dets.size()-1;i>=0;--i){ const Det&d=A.dets[i];
             int cx=d.x+d.w/2, cy=d.y+d.h/2;                       // centro de la etiqueta
             if(cx>=c0&&cx<=c1&&cy>=r0&&cy<=r1){ A.dets.erase(A.dets.begin()+i); ++n; } }
-        if(n){ A.sel=-1; A.dirty=true; } return n; }
-    if(A.sel>=0&&A.sel<(int)A.dets.size()){ A.dets.erase(A.dets.begin()+A.sel); A.sel=-1; A.dirty=true; return 1; }
+        if(n){ A.sel=-1; A.dirty=true; invalidate_dets_caches(); } return n; }
+    if(A.sel>=0&&A.sel<(int)A.dets.size()){ A.dets.erase(A.dets.begin()+A.sel); A.sel=-1; A.dirty=true; invalidate_dets_caches(); return 1; }
     return 0; }
+
+// Corta las etiquetas que intersectan con la caja de seleccion.
+// Etiqueta dentro de la caja -> borrar. Superposicion -> recortar (mascara + componente conexo).
+// Preserva huecos existentes via find_holes sobre la mascara resultante.
+static int cut_in_selection(){
+    if(A.sc0<0||A.sc1<=A.sc0) return 0;
+    int c0=min(A.sc0,A.sc1), c1=max(A.sc0,A.sc1);
+    bool hasR=(A.sr0>=0&&A.sr1>=0);
+    int r0=hasR?min(A.sr0,A.sr1):0, r1=hasR?max(A.sr0,A.sr1):A.spec.H;
+    int W=A.spec.W, H=A.spec.H;
+    int n=0;
+    for(int i=(int)A.dets.size()-1;i>=0;--i){
+        Det& d=A.dets[i];
+        if(d.x+d.w<=c0||d.x>=c1||d.y+d.h<=r0||d.y>=r1) continue;
+        if(d.x>=c0&&d.x+d.w<=c1&&d.y>=r0&&d.y+d.h<=r1){
+            A.dets.erase(A.dets.begin()+i); ++n; continue; }
+        Mask detMask((size_t)W*H, 0);
+        if(d.kind==KIND_POLY&&d.px.size()>=3){
+            for(int y=std::max(0,d.y);y<std::min(H,d.y+d.h);++y){
+                std::vector<int> nodes; int np=(int)d.px.size();
+                for(int k=0;k<np;++k){ int k2=(k+1)%np;
+                    float y1a=(float)d.py[k], y2a=(float)d.py[k2];
+                    if((y1a<(float)y&&y2a>=(float)y)||(y2a<(float)y&&y1a>=(float)y)){
+                        float xint=(float)d.px[k]+(float)(d.px[k2]-d.px[k])*(y-y1a)/(y2a-y1a);
+                        nodes.push_back((int)xint); } }
+                std::sort(nodes.begin(),nodes.end());
+                for(size_t k=0;k+1<nodes.size();k+=2)
+                    for(int x=std::max(0,nodes[k]);x<std::min(W,nodes[k+1]+1);++x)
+                        detMask[(size_t)y*W+x]=1; }
+            for(size_t hh=0;hh<d.hx.size();++hh){
+                if((int)d.hx[hh].size()<3) continue;
+                for(int y=std::max(0,d.y);y<std::min(H,d.y+d.h);++y){
+                    std::vector<int> nodes; int np=(int)d.hx[hh].size();
+                    for(int k=0;k<np;++k){ int k2=(k+1)%np;
+                        float y1a=(float)d.hy[hh][k], y2a=(float)d.hy[hh][k2];
+                        if((y1a<(float)y&&y2a>=(float)y)||(y2a<(float)y&&y1a>=(float)y)){
+                            float xint=(float)d.hx[hh][k]+(float)(d.hx[hh][k2]-d.hx[hh][k])*(y-y1a)/(y2a-y1a);
+                            nodes.push_back((int)xint); } }
+                    std::sort(nodes.begin(),nodes.end());
+                    for(size_t k=0;k+1<nodes.size();k+=2)
+                        for(int x=std::max(0,nodes[k]);x<std::min(W,nodes[k+1]+1);++x)
+                            detMask[(size_t)y*W+x]=0; } }
+        } else {
+            for(int y=std::max(0,d.y);y<std::min(H,d.y+d.h);++y)
+                for(int x=std::max(0,d.x);x<std::min(W,d.x+d.w);++x)
+                    detMask[(size_t)y*W+x]=1; }
+        for(int y=r0;y<r1;++y)
+            for(int x=c0;x<c1;++x)
+                if(x>=0&&x<W&&y>=0&&y<H) detMask[(size_t)y*W+x]=0;
+        bool any=false;
+        for(size_t k=0;k<detMask.size();++k) if(detMask[k]){ any=true; break; }
+        if(!any){ A.dets.erase(A.dets.begin()+i); ++n; continue; }
+        std::vector<int> lab((size_t)W*H, 0); int nextLabel=0;
+        const int dx8[8]={1,1,0,-1,-1,-1,0,1}; const int dy8[8]={0,1,1,1,0,-1,-1,-1};
+        struct Comp{ int label; int area; int minx,maxx,miny,maxy; int startx,starty; };
+        std::vector<Comp> comps;
+        for(int y=0;y<H;++y) for(int x=0;x<W;++x){
+            if(!detMask[y*W+x]||lab[y*W+x]) continue; ++nextLabel;
+            int area=0,minx=x,maxx=x,miny=y,maxy=y;
+            std::queue<std::pair<int,int>> q; q.push({x,y}); lab[y*W+x]=nextLabel;
+            while(!q.empty()){ auto[cx,cy]=q.front(); q.pop(); ++area;
+                minx=std::min(minx,cx); maxx=std::max(maxx,cx);
+                miny=std::min(miny,cy); maxy=std::max(maxy,cy);
+                for(int k=0;k<8;++k){ int nx=cx+dx8[k],ny=cy+dy8[k];
+                    if(nx<0||nx>=W||ny<0||ny>=H) continue;
+                    if(detMask[ny*W+nx]&&!lab[ny*W+nx]){ lab[ny*W+nx]=nextLabel; q.push({nx,ny}); } } }
+            comps.push_back({nextLabel,area,minx,maxx,miny,maxy,x,y}); }
+        A.dets.erase(A.dets.begin()+i);
+        for(auto& comp: comps){
+            if(comp.area<A.area_min) continue;
+            Det nd; nd.kind=KIND_POLY; nd.cls=d.cls;
+            nd.x=comp.minx; nd.y=comp.miny;
+            nd.w=comp.maxx-comp.minx+1; nd.h=comp.maxy-comp.miny+1;
+            std::vector<int> bx,by;
+            trace_boundary(lab, W, H, comp.label, comp.startx, comp.starty, bx, by);
+            for(size_t k=0;k<bx.size();++k){ nd.px.push_back(bx[k]); nd.py.push_back(by[k]); }
+            if(nd.px.size()<3){ nd.px={nd.x,nd.x+nd.w,nd.x+nd.w,nd.x}; nd.py={nd.y,nd.y,nd.y+nd.h,nd.y+nd.h}; }
+            sync_bbox_from_poly(nd);
+            find_holes(detMask, W, H, comp.minx, comp.miny, comp.maxx, comp.maxy, 1, A.area_min, nd.hx, nd.hy);
+            A.dets.push_back(std::move(nd)); ++n; } }
+    if(n){ A.sel=-1; A.dirty=true; invalidate_dets_caches(); }
+    return n;
+}
 // asigna la clase `cls` a TODAS las etiquetas cuyo CENTRO cae en la caja de seleccion (tiempo +
 // frecuencia si la hay). Para "Cambiar etiqueta" en lote (uno o varios poligonos). Devuelve cuantas cambio.
 static int set_class_in_selection(int cls){
@@ -1422,7 +1845,7 @@ static bool delete_marked_vertex(){ if(A.selDet<0||A.selDet>=(int)A.dets.size())
         if(A.selVert>=(int)d.px.size())return false;
         if((int)d.px.size()<=3){ A.dets.erase(A.dets.begin()+A.selDet); A.sel=-1; }   // <3 -> borra etiqueta
         else { d.px.erase(d.px.begin()+A.selVert); d.py.erase(d.py.begin()+A.selVert); sync_bbox_from_poly(d); } }
-    A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.dirty=true; return true; }
+    A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.dirty=true; invalidate_dets_caches(); return true; }
 static void guardar(bool silent=false){ if(A.spec.W<1)return; std::string stem=A.fname; { size_t p=stem.find_last_of('.'); if(p!=std::string::npos)stem=stem.substr(0,p); }
     if(stem.empty()||stem=="(sin archivo)")stem="etiquetas"; std::string base=A.out_dir+"/"+stem;  // nombrar por el audio
     if(!silent) show_busy("Guardando COCO + Raven...");
@@ -1434,16 +1857,73 @@ static void guardar(bool silent=false){ if(A.spec.W<1)return; std::string stem=A
     RavenGeom g{A.spec.W,A.spec.H,A.sr,A.P.hop}; export_raven(base+".txt",A.dets,A.classes,g);
     A.dirty=false;
     std::cout<<(silent?"Autosave ":"Guardado ")<<base<<".json + .txt(Raven) ("<<A.dets.size()<<" etiquetas)\n"; }
+// --- Exportar/importar mascara de fondo (BMP: blanco=fondo, negro=senal) ---
+static std::string mask_path_for_current(){ std::string stem=A.fname; { size_t p=stem.find_last_of('.'); if(p!=std::string::npos)stem=stem.substr(0,p); }
+    if(stem.empty()||stem=="(sin archivo)")stem="etiquetas"; return A.out_dir+"/"+stem+"_mask.bmp"; }
+static void export_background_mask(){
+    if(A.spec.W<1) return;
+    show_busy("Exportando mascara de fondo...");
+    int W=A.spec.W, H=A.spec.H;
+    RGBImg mask(W,H);
+    bool hasMask=!A.eraserMask.empty();
+    for(int r=0;r<H;++r){ float f=(float)(H-1-r)/(H-1);
+        for(int c=0;c<W;++c){ float e=A.enh.at(r,c);
+            bool isBg = (e < A.dbMin) || (e > A.dbMax) || (hasMask && A.eraserMask[r*W+c]) || (e < 0.02f);
+            size_t i=((size_t)r*W+c)*3;
+            uint8_t v = isBg ? 255 : 0;
+            mask.d[i]=v; mask.d[i+1]=v; mask.d[i+2]=v; } }
+    std::string path=mask_path_for_current();
+    if(write_bmp(path,mask)) std::cout<<"Mascara de fondo exportada: "<<path<<"\n";
+    else std::cout<<"Error al exportar mascara: "<<path<<"\n"; }
+static void load_background_mask(){
+    std::string path=mask_path_for_current();
+    RGBImg mask=read_bmp(path);
+    if(mask.W<1||mask.H<1){ std::cout<<"No se encontro mascara: "<<path<<"\n"; return; }
+    if(mask.W!=A.spec.W||mask.H!=A.spec.H){ std::cout<<"Dimensiones de mascara no coinciden: "<<mask.W<<"x"<<mask.H<<" vs "<<A.spec.W<<"x"<<A.spec.H<<"\n"; return; }
+    int W=mask.W, H=mask.H;
+    A.eraserMask.resize((size_t)W*H);
+    for(int r=0;r<H;++r) for(int c=0;c<W;++c){
+        size_t i=((size_t)r*W+c)*3;
+        // Blanco (cualquier canal > 128) -> fondo (eraserMask=1); negro -> normal (0)
+        A.eraserMask[r*W+c] = (mask.d[i]>128 || mask.d[i+1]>128 || mask.d[i+2]>128) ? 1 : 0; }
+    A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+    upload_texture();
+    std::cout<<"Mascara de fondo cargada: "<<path<<"\n"; }
+// cargar mascara desde un path arbitrario (para drag-and-drop de BMP)
+static bool load_mask_from_path(const std::string& path){
+    if(A.spec.W<1){ std::cout<<"No hay audio cargado para aplicar mascara\n"; return false; }
+    RGBImg mask=read_bmp(path);
+    if(mask.W<1||mask.H<1){ std::cout<<"Error al leer mascara BMP: "<<path<<"\n"; return false; }
+    if(mask.W!=A.spec.W||mask.H!=A.spec.H){ std::cout<<"Dimensiones de mascara no coinciden: "<<mask.W<<"x"<<mask.H<<" vs "<<A.spec.W<<"x"<<A.spec.H<<"\n"; return false; }
+    int W=mask.W, H=mask.H;
+    A.eraserMask.resize((size_t)W*H);
+    for(int r=0;r<H;++r) for(int c=0;c<W;++c){
+        size_t i=((size_t)r*W+c)*3;
+        A.eraserMask[r*W+c]=(mask.d[i]>128||mask.d[i+1]>128||mask.d[i+2]>128)?1:0; }
+    A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+    upload_texture();
+    std::cout<<"Mascara cargada: "<<path<<"\n";
+    return true; }
+// extraer stem (nombre sin extension) de un path
+static std::string stem_from_path(const std::string& path){
+    std::string base=path; { size_t p=base.find_last_of("/\\"); if(p!=std::string::npos)base=base.substr(p+1); }
+    size_t dp=base.find_last_of('.'); if(dp!=std::string::npos)base=base.substr(0,dp);
+    return base; }
 // firma (hash) del estado de etiquetas: detecta CUALQUIER cambio para el autosave
-static unsigned long long labels_sig(){ unsigned long long s=1469598103934665603ULL;
+// Cache: solo recalcula cuando labelsSigDirty=true (marca invalidate_dets_caches).
+static unsigned long long compute_labels_sig(){ unsigned long long s=1469598103934665603ULL;
     auto mix=[&](long long v){ s=(s^(unsigned long long)v)*1099511628211ULL; };
     mix((long long)A.dets.size()); mix((long long)A.classes.size());
     for(const Det&d:A.dets){ mix(d.x);mix(d.y);mix(d.w);mix(d.h);mix(d.cls);mix(d.kind);mix((long long)d.px.size());
         for(size_t k=0;k<d.px.size();++k){ mix(d.px[k]); mix(d.py[k]); }
-        mix((long long)d.hx.size());                                          // ANILLOS/huecos: para que mover/insertar/borrar un vertice de anillo TAMBIEN dispare el autosave
+        mix((long long)d.hx.size());
         for(size_t hh=0;hh<d.hx.size();++hh){ mix((long long)d.hx[hh].size());
             for(size_t k=0;k<d.hx[hh].size();++k){ mix(d.hx[hh][k]); mix(d.hy[hh][k]); } } }
     return s; }
+static unsigned long long labels_sig() {
+    if (A.labelsSigDirty) { A.cachedLabelSig = compute_labels_sig(); A.labelsSigDirty = false; }
+    return A.cachedLabelSig;
+}
 // autosave: si la firma cambio y no se esta arrastrando/escribiendo, guarda en silencio
 static void autosave_tick(){ static int t=0; if(++t<100)return; t=0;   // ~cada 1 s
     if(A.spec.W<1||A.fname=="(sin archivo)"||A.dragging||A.naming||A.buffering)return;
@@ -1454,22 +1934,45 @@ static void cargar_raven(){
     if(g_dialogOpen){ if(g_hwnd)SetForegroundWindow(g_hwnd); return; }   // ya hay un dialogo abierto -> traer al frente, NO abrir otro
     g_dialogOpen=true;
     char f[MAX_PATH]=""; OPENFILENAMEA o{}; o.lStructSize=sizeof(o); o.hwndOwner=g_hwnd;
-    o.lpstrFilter="Raven selection table\0*.txt\0Todos\0*.*\0"; o.lpstrFile=f; o.nMaxFile=MAX_PATH;
+    o.lpstrFilter="Raven / Mascara\0*.txt;*_mask.bmp\0Raven (.txt)\0*.txt\0Mascara (.bmp)\0*mask.bmp\0Todos\0*.*\0";
+    o.lpstrFile=f; o.nMaxFile=MAX_PATH;
     o.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST; bool ok=GetOpenFileNameA(&o)!=0; g_dialogOpen=false;
     if(!ok)return; if(A.spec.W<1)return;
-    show_busy("Cargando etiquetas Raven...");
-    RavenGeom g{A.spec.W,A.spec.H,A.sr,A.P.hop};
-    std::vector<Det> in=import_raven(f,g,A.classes); for(auto&d:in)A.dets.push_back(d);
-    A.sel=-1; layout_botones(); std::cout<<"Cargadas "<<in.size()<<" etiquetas Raven de "<<f<<"\n"; }
+    // detectar extension
+    std::string path(f);
+    std::string ext=""; { size_t p=path.find_last_of('.'); if(p!=std::string::npos)ext=path.substr(p); }
+    // convertir a minusculas
+    for(auto&c:ext) if(c>='A'&&c<='Z') c=c-'A'+'a';
+    if(ext==".bmp" || ext==".BMP"){
+        // --- cargar mascara BMP ---
+        RGBImg mask=read_bmp(path);
+        if(mask.W<1||mask.H<1){ std::cout<<"Error al leer mascara BMP: "<<path<<"\n"; return; }
+        if(mask.W!=A.spec.W||mask.H!=A.spec.H){ std::cout<<"Dimensiones de mascara no coinciden: "<<mask.W<<"x"<<mask.H<<" vs "<<A.spec.W<<"x"<<A.spec.H<<"\n"; return; }
+        A.eraserMask.resize((size_t)mask.W*mask.H);
+        for(int r=0;r<mask.H;++r) for(int c=0;c<mask.W;++c){
+            size_t i=((size_t)r*mask.W+c)*3;
+            A.eraserMask[r*mask.W+c]=(mask.d[i]>128||mask.d[i+1]>128||mask.d[i+2]>128)?1:0; }
+        A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+        upload_texture();
+        std::cout<<"Mascara de fondo cargada: "<<path<<"\n";
+    } else {
+        // --- cargar Raven .txt ---
+        show_busy("Cargando etiquetas Raven...");
+        RavenGeom g{A.spec.W,A.spec.H,A.sr,A.P.hop};
+        std::vector<Det> in=import_raven(f,g,A.classes); for(auto&d:in)A.dets.push_back(d);
+        A.sel=-1; layout_botones(); invalidate_dets_caches(); std::cout<<"Cargadas "<<in.size()<<" etiquetas Raven de "<<f<<"\n";
+    }
+}
 static void crear_caja(int cls){ if(A.sc0<0||A.sc1<=A.sc0)return; push_undo(); Det d; d.x=A.sc0; d.w=A.sc1-A.sc0;
     if(A.sr0>=0&&A.sr1>=0){d.y=min(A.sr0,A.sr1);d.h=max(1,std::abs(A.sr1-A.sr0));}else{d.y=0;d.h=A.spec.H;}
     d.px={d.x,d.x+d.w,d.x+d.w,d.x}; d.py={d.y,d.y,d.y+d.h,d.y+d.h}; d.cls=cls;
-    A.dets.push_back(d); A.sel=(int)A.dets.size()-1; }
+    A.dets.push_back(d); A.sel=(int)A.dets.size()-1; invalidate_dets_caches(); }
 // Fijar valor de senal: el humano baja el TECHO de dB escuchando hasta que el
 // sonido se vuelve ruido; al pulsar, ese techo (umbral de senal) pasa a ser el
 // PISO y el techo se abre al maximo -> el filtro muestra de ese valor a 0 dB.
 static void set_signal_value(){ if(A.spec.W<1)return; float thr=A.dbMax;
-    A.dbMin=max(0.f,min(0.98f,thr)); A.dbMax=1.0f; upload_texture(); A.refilterPending=true;
+    A.dbMin=max(0.f,min(0.98f,thr)); A.dbMax=1.0f; upload_texture(); eraser_reset_if_filter_changed();
+    A.refilterPending=true;
     std::cout<<"Valor de senal fijado: piso dB="<<(A.dbMin-1)*A.P.dyn_range_db<<" dB\n"; }
 
 // zoom 2D: reescala las ventanas de tiempo (vc) y frecuencia (vr) por 'factor',
@@ -1481,10 +1984,10 @@ static void zoom2d(float factor,int cc,int cr){ int W=A.spec.W,H=A.spec.H; if(W<
     int nv0=cc-(int)(fx*ncw); nv0=max(0,min(W-ncw,nv0)); A.vc0=nv0; A.vc1=nv0+ncw;
     int nr0=cr-(int)(fy*nch); nr0=max(0,min(H-nch,nr0)); A.vr0=nr0; A.vr1=nr0+nch; }
 static void do_action(int c){
-    if(c=='q')PostQuitMessage(0);
+    if(c=='q'){ if(A.spec.W>0) close_audio(); else PostQuitMessage(0); }
     else if(c=='f')set_signal_value();   // fija el techo escuchado como piso de senal
     else if(c>='1'&&c<='7'){ A.view=c-'0'; layout_botones(); }   // relayout: botones segun la vista (1-7)
-    else if(c=='G')A.quiver_completo=!A.quiver_completo;          // Quiver: glifos completos
+    else if(c=='Q')A.quiver_completo=!A.quiver_completo;          // Quiver: glifos completos
     else if(c=='B')A.solo_banda=!A.solo_banda;
     else if(c=='v'){ A.playSpeed=max(0.1f,A.playSpeed-0.1f); A.playSpeed=roundf(A.playSpeed*10.f)/10.f; A.refilterPending=true; }   // mas lento (-0.1x)
     else if(c=='V'){ A.playSpeed=min(4.0f,A.playSpeed+0.1f); A.playSpeed=roundf(A.playSpeed*10.f)/10.f; A.refilterPending=true; }   // mas rapido (+0.1x)
@@ -1493,6 +1996,8 @@ static void do_action(int c){
     else if(c=='P'){A.tool=T_POLY;A.shape_poly=true;A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}                 // etiquetar poligono
     else if(c=='E'){A.tool=T_EDIT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}   // editar forma
     else if(c=='X'){A.tool=T_CUT;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}    // corte libre
+    else if(c=='J'){A.tool=T_MERGE;A.mergeFirst=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}  // unir etiquetas
+    else if(c=='d'){A.tool=T_ERASER;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();}   // borrador
     else if(c=='N'){ A.naming=true; A.nameBuf.clear(); }  // crear etiqueta (captura de texto)
     else if(c=='R')cargar_raven();                    // cargar Raven
     else if(c=='H')A.rio_completo=!A.rio_completo;   // rio: hilos completos vs corte por vertice
@@ -1516,7 +2021,7 @@ static void do_action(int c){
         else if(c=='g')A.dbMin=max(0.f,A.dbMin-sd);           // piso dB -
         else if(c=='w')A.dbMax=min(1.f,A.dbMax+sd);           // techo dB +
         else if(c=='e')A.dbMax=max(A.dbMin+sd,A.dbMax-sd);    // techo dB -
-        upload_texture(); A.refilterPending=true; }           // re-filtra el sonido en vivo
+        upload_texture(); eraser_reset_if_filter_changed(); A.refilterPending=true; }           // re-filtra el sonido en vivo
     else if(c=='o')open_dialog();
     else if(c==' '){ if(PLAYER.playing&&PLAYER.cur_sample()>=0)PLAYER.pause_toggle(); else play_window(); }  // espacio = play/pausa
     else if(c=='p')play_filtered(0,A.spec.W,false,0,1);   // todo, con filtros aplicados
@@ -1526,17 +2031,19 @@ static void do_action(int c){
     else if(c=='a'&&A.spec.W>0)auto_segment();
     else if(c=='l'&&A.sc0>=0&&A.sc1>A.sc0){ Det d; d.x=A.sc0;d.w=A.sc1-A.sc0;
         if(A.sr0>=0&&A.sr1>=0){d.y=min(A.sr0,A.sr1);d.h=std::abs(A.sr1-A.sr0);}else{d.y=0;d.h=A.spec.H;}
-        d.px={d.x,d.x+d.w,d.x+d.w,d.x};d.py={d.y,d.y,d.y+d.h,d.y+d.h};d.cls=A.clase_activa;A.dets.push_back(d);}
+        d.px={d.x,d.x+d.w,d.x+d.w,d.x};d.py={d.y,d.y,d.y+d.h,d.y+d.h};d.cls=A.clase_activa;A.dets.push_back(d);invalidate_dets_caches();}
     else if(c=='t')A.modo_hilo=!A.modo_hilo;
     else if(c=='b')A.clase_activa=0;                              // bio
     else if(c=='n'&&A.classes.size()>1)A.clase_activa=1;          // antro
-    else if(c=='z'&&A.sel>=0){push_undo();A.dets[A.sel].cls=A.clase_activa;A.dirty=true;}    // asigna la clase activa al seleccionado
-    else if(c=='d'&&A.sel>=0){A.dets.erase(A.dets.begin()+A.sel);A.sel=-1;}
-    else if(c=='c'){push_undo();A.dets.clear();A.hilos.clear();A.sel=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();A.listSel.clear();}
+    else if(c=='z'&&A.sel>=0){push_undo();A.dets[A.sel].cls=A.clase_activa;A.dirty=true;invalidate_dets_caches();}    // asigna la clase activa al seleccionado
+    else if(c=='c'){push_undo();A.dets.clear();A.hilos.clear();A.sel=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();A.listSel.clear();invalidate_dets_caches();}
     else if(c=='s')guardar();
+    else if(c=='K')export_background_mask();   // exportar mascara de fondo
+    else if(c=='F'){ A.refining=!A.refining; }   // abrir/cerrar modal de refinamiento
+    else if(c=='h'){ A.show_mask=!A.show_mask; upload_texture(); }   // mostrar/ocultar mascara del borrador
 }
 static void ayuda(){ std::cout<<"\n=== raven.exe ===\n Botones arriba o teclas: o abrir, 1-5 vistas, ESPACIO play sel, p todo, k pausa, . stop,\n"
-    " a auto, l caja, t hilo, b/n clase, z/x set sel, d borra, c limpia, s guarda, r ejes(3D), q salir.\n"
+    " a auto, l caja, t hilo, b/n clase, z asig cl, d borrador, G clic forma, F afinar, h ver mascara, Supr borra, c limpia, s guarda, K mascara fondo, r ejes(3D), q salir.\n"
     " Etiqueta arrastrando en la vista 2D o en la tira inferior (sirve en 3D). Arrastrar selecciona\n"
     " tiempo+frecuencia; ESPACIO reproduce SOLO esa banda. Clic simple = mover playhead (seek).\n"; }
 
@@ -1574,6 +2081,7 @@ static void fbar_drag(int code,int my){ Bar bf=bar_freq(),bd=bar_db(),bg=bar_gai
     else if(code==11)flt_dbMax()=max(flt_dbMin()+0.002f,bar_v(bd,my));
     flt_fLo()=max(0.f,flt_fLo());flt_fHi()=min(1.f,flt_fHi());flt_dbMin()=max(0.f,flt_dbMin());flt_dbMax()=min(1.f,flt_dbMax());
     if(A.view!=7) upload_texture();              // V7: filtro local, no reconstruye la textura 2D
+    eraser_reset_if_filter_changed();
     if(code>=8&&code<=11)A.refilterPending=true; }  // dB/freq cambiaron -> re-filtrar el sonido en vivo (incl. V7)
 
 // posicion en pantalla (vista 2D) de una coord de espectro (col,row)
@@ -1690,7 +2198,7 @@ static void split_free(int idx){ if(idx<0||idx>=(int)A.dets.size()||A.cutX.size(
             else if(pt_in_poly(p2.px,p2.py,(float)cx,(float)cy)){ p2.hx.push_back(d.hx[hh]); p2.hy.push_back(d.hy[hh]); } }
         A.dets.erase(A.dets.begin()+idx);
         A.dets.insert(A.dets.begin()+idx,p2); A.dets.insert(A.dets.begin()+idx,p1);
-        A.sel=idx; return;
+        A.sel=idx; invalidate_dets_caches(); return;
     }
     if((A0.loop==0)!=(B0.loop==0)){
         // ===== EXTERIOR <-> ANILLO: ABRE el anillo (lo une al borde por el trazo; queda 1 pieza sin ese hueco) =====
@@ -1728,23 +2236,299 @@ static void split_free(int idx){ if(idx<0||idx>=(int)A.dets.size()||A.cutX.size(
     // anillo<->anillo (u otros): no se separa por ahora
 }
 
+// --- Convex hull (Andrew's monotone chain) ---
+static std::vector<std::pair<int,int>> convex_hull(std::vector<std::pair<int,int>> pts) {
+    int n=(int)pts.size(); if(n<=2) return pts;
+    std::sort(pts.begin(),pts.end());
+    std::vector<std::pair<int,int>> hull;
+    hull.reserve(n+1);
+    for(int i=0;i<n;++i){ while(hull.size()>=2){
+        auto& a=hull[hull.size()-2]; auto& b=hull[hull.size()-1];
+        if((long long)(b.first-a.first)*(pts[i].second-a.second)-(long long)(b.second-a.second)*(pts[i].first-a.first)<=0) hull.pop_back();
+        else break; }
+        hull.push_back(pts[i]); }
+    int k=(int)hull.size();
+    for(int i=n-2;i>=0;--i){ while((int)hull.size()>=k+1){
+        auto& a=hull[hull.size()-2]; auto& b=hull[hull.size()-1];
+        if((long long)(b.first-a.first)*(pts[i].second-a.second)-(long long)(b.second-a.second)*(pts[i].first-a.first)<=0) hull.pop_back();
+        else break; }
+        hull.push_back(pts[i]); }
+    if(hull.size()>1) hull.pop_back();
+    return hull;
+}
+
+// --- Unir dos etiquetas: combina sus vertices en una sola forma (convex hull) ---
+static void merge_dets(int i, int j) {
+    if(i<0||j<0||i>=(int)A.dets.size()||j>=(int)A.dets.size()||i==j) return;
+    Det& a=A.dets[i]; Det& b=A.dets[j];
+    // Recopilar todos los vertices de ambas etiquetas
+    std::vector<std::pair<int,int>> pts;
+    auto add_verts=[&](const Det& d){
+        const std::vector<int>& px=(d.kind==KIND_POLY&&d.px.size()>=3)?d.px:
+            std::vector<int>{d.x,d.x+d.w,d.x+d.w,d.x};
+        const std::vector<int>& py=(d.kind==KIND_POLY&&d.py.size()>=3)?d.py:
+            std::vector<int>{d.y,d.y,d.y+d.h,d.y+d.h};
+        for(size_t k=0;k<px.size();++k) pts.push_back({px[k],py[k]});
+    };
+    add_verts(a);
+    add_verts(b);
+    // Convex hull de todos los vertices
+    auto hull=convex_hull(pts);
+    // Crear nueva etiqueta
+    Det nd;
+    nd.kind=KIND_POLY;
+    nd.cls=a.cls;
+    nd.px.clear(); nd.py.clear();
+    for(auto& p:hull){ nd.px.push_back(p.first); nd.py.push_back(p.second); }
+    if(nd.px.size()<3){ nd.px={nd.x,nd.x+nd.w,nd.x+nd.w,nd.x}; nd.py={nd.y,nd.y,nd.y+nd.h,nd.y+nd.h}; }
+    sync_bbox_from_poly(nd);
+    // Eliminar la segunda y reemplazar la primera
+    if(i>j) std::swap(i,j);
+    A.dets.erase(A.dets.begin()+j);
+    A.dets[i]=nd;
+    A.sel=i; A.mergeFirst=-1;
+    invalidate_dets_caches();
+    std::cout<<"Etiquetas unidas: "<<nd.px.size()<<" vertices\n";
+}
+
+// --- Crear agujero: subtract selection rectangle from the label under cursor ---
+static void create_hole_in_selection() {
+    if(A.sc0<0||A.sc1<=A.sc0) return;
+    int c0=min(A.sc0,A.sc1), c1=max(A.sc0,A.sc1);
+    bool hasR=(A.sr0>=0&&A.sr1>=0);
+    int r0=hasR?min(A.sr0,A.sr1):0, r1=hasR?max(A.sr0,A.sr1):A.spec.H;
+    int W=A.spec.W, H=A.spec.H;
+    // Find label that contains the center of the selection
+    float cx=(float)(c0+c1)/2, cy=(float)(r0+r1)/2;
+    int idx=-1;
+    for(int i=0;i<(int)A.dets.size();++i)
+        if(pt_in_det(A.dets[i],cx,cy)){ idx=i; break; }
+    if(idx<0) return;
+    Det& d=A.dets[idx];
+    if(d.kind!=KIND_POLY||d.px.size()<3) return;
+    push_undo();
+    // Create hole polygon (rectangle from selection)
+    std::vector<int> hpx={c0,c1,c1,c0};
+    std::vector<int> hpy={r0,r0,r1,r1};
+    d.hx.push_back(hpx);
+    d.hy.push_back(hpy);
+    sync_bbox_from_poly(d);
+    A.dirty=true; invalidate_dets_caches();
+    std::cout<<"Agujero creado en etiqueta #"<<idx<<"\n";
+}
+
+// --- Helper: polygon mask from Det ---
+static Mask det_to_mask(const Det& d, int W, int H) {
+    Mask mask((size_t)W*H, 0);
+    const std::vector<int>& px=(d.kind==KIND_POLY&&d.px.size()>=3)?d.px:
+        std::vector<int>{d.x,d.x+d.w,d.x+d.w,d.x};
+    const std::vector<int>& py=(d.kind==KIND_POLY&&d.py.size()>=3)?d.py:
+        std::vector<int>{d.y,d.y,d.y+d.h,d.y+d.h};
+    int ylo=d.y, yhi=d.y+d.h;
+    for(int y=std::max(0,ylo);y<std::min(H,yhi);++y){
+        std::vector<int> nodes;
+        int np=(int)px.size();
+        for(int k=0;k<np;++k){
+            int k2=(k+1)%np;
+            float ya=(float)py[k], yb=(float)py[k2];
+            if((ya<(float)y&&yb>=(float)y)||(yb<(float)y&&ya>=(float)y)){
+                float xint=(float)px[k]+(float)(px[k2]-px[k])*(y-ya)/(yb-ya);
+                nodes.push_back((int)xint);
+            }
+        }
+        std::sort(nodes.begin(),nodes.end());
+        for(size_t k=0;k+1<nodes.size();k+=2)
+            for(int x=std::max(0,nodes[k]);x<std::min(W,nodes[k+1]+1);++x)
+                mask[(size_t)y*W+x]=1;
+    }
+    // Subtract holes
+    for(size_t hh=0;hh<d.hx.size();++hh){
+        if((int)d.hx[hh].size()<3) continue;
+        for(int y=std::max(0,ylo);y<std::min(H,yhi);++y){
+            std::vector<int> nodes;
+            int np=(int)d.hx[hh].size();
+            for(int k=0;k<np;++k){
+                int k2=(k+1)%np;
+                float ya=(float)d.hy[hh][k], yb=(float)d.hy[hh][k2];
+                if((ya<(float)y&&yb>=(float)y)||(yb<(float)y&&ya>=(float)y)){
+                    float xint=(float)d.hx[hh][k]+(float)(d.hx[hh][k2]-d.hx[hh][k])*(y-ya)/(yb-ya);
+                    nodes.push_back((int)xint);
+                }
+            }
+            std::sort(nodes.begin(),nodes.end());
+            for(size_t k=0;k+1<nodes.size();k+=2)
+                for(int x=std::max(0,nodes[k]);x<std::min(W,nodes[k+1]+1);++x)
+                    mask[(size_t)y*W+x]=0;
+        }
+    }
+    return mask;
+}
+
+// --- Dilate/Erode a Det polygon using mask morphology ---
+static void dilate_det(Det& d, int W, int H, int kw, int kh) {
+    Mask mask=det_to_mask(d,W,H);
+    Mask buf((size_t)W*H);
+    dilate_into(mask,buf,W,H,kw,kh);
+    // Trace boundary of dilated mask
+    std::vector<int> lab((size_t)W*H,0); int next=0; int bestL=0; int bestA=0;
+    const int dx8[8]={1,1,0,-1,-1,-1,0,1}; const int dy8[8]={0,1,1,1,0,-1,-1,-1};
+    for(int y=0;y<H;++y) for(int x=0;x<W;++x){
+        if(!buf[y*W+x]||lab[y*W+x]) continue;
+        ++next; int area=0,minx=x,maxx=x,miny=y,maxy=y;
+        std::queue<std::pair<int,int>> q; q.push({x,y}); lab[y*W+x]=next;
+        while(!q.empty()){ auto[cx,cy]=q.front(); q.pop(); ++area;
+            minx=std::min(minx,cx); maxx=std::max(maxx,cx); miny=std::min(miny,cy); maxy=std::max(maxy,cy);
+            for(int k=0;k<8;++k){ int nx=cx+dx8[k],ny=cy+dy8[k];
+                if(nx<0||nx>=W||ny<0||ny>=H) continue;
+                if(buf[ny*W+nx]&&!lab[ny*W+nx]){ lab[ny*W+nx]=next; q.push({nx,ny}); } } }
+        if(area>bestA){ bestA=area; bestL=next; } }
+    if(bestL==0) return;
+    int sx=-1,sy=-1;
+    for(int y=0;y<H&&sx<0;++y) for(int x=0;x<W&&sx<0;++x) if(lab[y*W+x]==bestL){ sx=x; sy=y; }
+    std::vector<int> bx,by; trace_boundary(lab,W,H,bestL,sx,sy,bx,by);
+    d.kind=KIND_POLY; d.px.clear(); d.py.clear();
+    for(size_t k=0;k<bx.size();k+=2){ d.px.push_back(bx[k]); d.py.push_back(by[k]); }
+    if(d.px.size()<3){ d.px={d.x,d.x+d.w,d.x+d.w,d.x}; d.py={d.y,d.y,d.y+d.h,d.y+d.h}; }
+    sync_bbox_from_poly(d);
+}
+
+static void erode_det(Det& d, int W, int H, int kw, int kh) {
+    Mask mask=det_to_mask(d,W,H);
+    Mask buf((size_t)W*H);
+    erode_into(mask,buf,W,H,kw,kh);
+    // Check if anything remains
+    bool any=false; for(size_t k=0;k<buf.size();++k) if(buf[k]){ any=true; break; }
+    if(!any){ d.px.clear(); d.py.clear(); return; }  // collapsed to nothing
+    std::vector<int> lab((size_t)W*H,0); int next=0; int bestL=0; int bestA=0;
+    const int dx8[8]={1,1,0,-1,-1,-1,0,1}; const int dy8[8]={0,1,1,1,0,-1,-1,-1};
+    for(int y=0;y<H;++y) for(int x=0;x<W;++x){
+        if(!buf[y*W+x]||lab[y*W+x]) continue;
+        ++next; int area=0,minx=x,maxx=x,miny=y,maxy=y;
+        std::queue<std::pair<int,int>> q; q.push({x,y}); lab[y*W+x]=next;
+        while(!q.empty()){ auto[cx,cy]=q.front(); q.pop(); ++area;
+            minx=std::min(minx,cx); maxx=std::max(maxx,cx); miny=std::min(miny,cy); maxy=std::max(maxy,cy);
+            for(int k=0;k<8;++k){ int nx=cx+dx8[k],ny=cy+dy8[k];
+                if(nx<0||nx>=W||ny<0||ny>=H) continue;
+                if(buf[ny*W+nx]&&!lab[ny*W+nx]){ lab[ny*W+nx]=next; q.push({nx,ny}); } } }
+        if(area>bestA){ bestA=area; bestL=next; } }
+    if(bestL==0) return;
+    int sx=-1,sy=-1;
+    for(int y=0;y<H&&sx<0;++y) for(int x=0;x<W&&sx<0;++x) if(lab[y*W+x]==bestL){ sx=x; sy=y; }
+    std::vector<int> bx,by; trace_boundary(lab,W,H,bestL,sx,sy,bx,by);
+    d.kind=KIND_POLY; d.px.clear(); d.py.clear();
+    for(size_t k=0;k<bx.size();k+=2){ d.px.push_back(bx[k]); d.py.push_back(by[k]); }
+    if(d.px.size()<3){ d.px.clear(); d.py.clear(); return; }
+    sync_bbox_from_poly(d);
+}
+
+// --- Grow selected label: dilate + merge with overlapping neighbors ---
+static void grow_selected_label() {
+    if(A.sel<0||A.sel>=(int)A.dets.size()) return;
+    int W=A.spec.W, H=A.spec.H;
+    Det& d=A.dets[A.sel];
+    int curArea=d.w*d.h;
+    // Guardar area original en el primer Ctrl++
+    if(d.orig_area==0) d.orig_area=curArea;
+    // Si ya esta al tamano original o mas grande, no hacer nada
+    if(curArea>=d.orig_area) return;
+    push_undo();
+    dilate_det(d, W, H, 7, 5);
+    // Check for overlap with other labels and merge
+    bool merged=true;
+    while(merged){
+        merged=false;
+        Mask m1=det_to_mask(d,W,H);
+        for(int j=0;j<(int)A.dets.size();++j){
+            if(j==A.sel) continue;
+            Det& o=A.dets[j];
+            if(d.x+d.w<=o.x||o.x+o.w<=d.x||d.y+d.h<=o.y||o.y+o.h<=d.y) continue;
+            Mask m2=det_to_mask(o,W,H);
+            bool overlap=false;
+            for(size_t k=0;k<m1.size();++k) if(m1[k]&&m2[k]){ overlap=true; break; }
+            if(overlap){
+                std::vector<std::pair<int,int>> pts;
+                for(size_t k=0;k<d.px.size();++k) pts.push_back({d.px[k],d.py[k]});
+                for(size_t k=0;k<o.px.size();++k) pts.push_back({o.px[k],o.py[k]});
+                auto hull=convex_hull(pts);
+                d.px.clear(); d.py.clear();
+                for(auto& p:hull){ d.px.push_back(p.first); d.py.push_back(p.second); }
+                sync_bbox_from_poly(d);
+                A.dets.erase(A.dets.begin()+j);
+                if(j<A.sel) A.sel--;
+                merged=true;
+                invalidate_dets_caches();
+                break;
+            }
+        }
+    }
+    // Si la nueva area supera la original, revertir
+    if(d.w*d.h>d.orig_area){
+        A.undo.pop_back();
+        A.dirty=false; invalidate_dets_caches();
+        std::cout<<"No se agranda: ya esta en tamano original\n";
+        return;
+    }
+    A.dirty=true; invalidate_dets_caches();
+    std::cout<<"Etiqueta agrandada: "<<d.px.size()<<" vertices\n";
+}
+
+// --- Shrink selected label: erode ---
+static void shrink_selected_label() {
+    if(A.sel<0||A.sel>=(int)A.dets.size()) return;
+    int W=A.spec.W, H=A.spec.H;
+    push_undo();
+    Det& d=A.dets[A.sel];
+    erode_det(d, W, H, 7, 5);
+    if(d.px.empty()){
+        A.dets.erase(A.dets.begin()+A.sel);
+        A.sel=-1;
+        std::cout<<"Etiqueta eliminada (colapsó)\n";
+    } else {
+        std::cout<<"Etiqueta achicada: "<<d.px.size()<<" vertices\n";
+    }
+    A.dirty=true; invalidate_dets_caches();
+}
+
 static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
     switch(m){
     case WM_SIZE: A.cW=LOWORD(lp); A.cH=HIWORD(lp); layout_botones(); return 0;
     case WM_SETCURSOR: if(LOWORD(lp)==HTCLIENT){ POINT p; GetCursorPos(&p); ScreenToClient(h,&p); A.mx=p.x;A.my=p.y; SetCursor(pick_cursor()); return TRUE; } break;
-    case WM_DROPFILES:{ HDROP hdrop=(HDROP)wp; char path[MAX_PATH]="";   // ARRASTRAR Y SOLTAR: abre el WAV soltado sobre la ventana
-        UINT got=DragQueryFileA(hdrop,0,path,MAX_PATH); DragFinish(hdrop);   // toma el PRIMER archivo soltado
-        if(got>0){ std::string p=path; size_t n=p.size();                    // solo intenta abrir si termina en .wav (insensible a mayusculas)
+    case WM_DROPFILES:{ HDROP hdrop=(HDROP)wp; char path[MAX_PATH]="";   // ARRASTRAR Y SOLTAR: abre el WAV o BMP soltado sobre la ventana
+        UINT got=DragQueryFileA(hdrop,0,path,MAX_PATH); DragFinish(hdrop);
+        if(got>0){ std::string p=path; size_t n=p.size();
             bool isWav = n>=4 && p[n-4]=='.' && (p[n-3]=='w'||p[n-3]=='W') && (p[n-2]=='a'||p[n-2]=='A') && (p[n-1]=='v'||p[n-1]=='V');
-            if(isWav){ SetForegroundWindow(h); load_audio(p); } }
+            bool isBmp = n>=4 && p[n-4]=='.' && (p[n-3]=='b'||p[n-3]=='B') && (p[n-2]=='m'||p[n-2]=='M') && (p[n-1]=='p'||p[n-1]=='P');
+            if(isWav){ SetForegroundWindow(h); load_audio(p); }
+            else if(isBmp){ SetForegroundWindow(h);
+                if(A.spec.W<1){ MessageBoxA(h,"No hay un audio cargado. Abra un WAV primero.","Mascara",MB_OK|MB_ICONWARNING); return 0; }
+                std::string bmpStem=stem_from_path(p);
+                std::string audioStem=stem_from_path(A.fname);
+                bool match=(bmpStem.size()>=5 && bmpStem.substr(bmpStem.size()-5)=="_mask" && bmpStem.substr(0,bmpStem.size()-5)==audioStem);
+                if(match){ load_mask_from_path(p); }
+                else { A.maskPromptOpen=true; A.maskPromptPath=p; } } }
         return 0; }
     case WM_LBUTTONDOWN:{ int mx=LOWORD(lp),my=HIWORD(lp);
         if(A.showAbout){ A.showAbout=false; return 0; }                          // cualquier clic cierra el panel Acerca de
+        if(A.maskPromptOpen){ float w=480,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-50;
+            float bx0=x+w*0.5f-130,bx1=bx0+110,by0=y+62,by1=by0+26;            // boton "Abrir"
+            float cx0=bx1+20,cx1=cx0+110;                                       // boton "Cerrar"
+            if(mx>=bx0&&mx<=bx1&&my>=by0&&my<=by1){ load_mask_from_path(A.maskPromptPath); A.maskPromptOpen=false; }
+            else if(mx>=cx0&&mx<=cx1&&my>=by0&&my<=by1){ A.maskPromptOpen=false; }
+            else { A.maskPromptOpen=false; } return 0; }                        // cualquier otro clic cierra
         if(A.cmapOpen){ int ci=cmap_item_at(mx,my);                              // combo de mapa de color abierto
             if(ci>=0){ A.cmap=ci; build_cmap(); upload_texture(); }              // elige paleta -> reconstruye LUT y textura
             A.cmapOpen=false; return 0; }                                        // cualquier clic cierra el combo
         if(A.buffering){ float tx0,tx1,ty; bufslider(tx0,tx1,ty);                 // modal de buffer: arrastra la barra
             if(mx>=tx0-8&&mx<=tx1+8&&my>=ty-14&&my<=ty+14){ A.dragging=true; A.dragRegion=22; buffer_apply(mx); } return 0; }
+        if(A.refining){ float tx0,tx1,ty; refine_slider(tx0,tx1,ty);             // modal de refinamiento: arrastra la barra de radio
+            if(mx>=tx0-8&&mx<=tx1+8&&my>=ty-14&&my<=ty+14){ A.dragging=true; A.dragRegion=24;
+                float v=(mx-tx0)/(tx1-tx0>1?tx1-tx0:1); v=v<0?0:(v>1?1:v);
+                A.refineRadius=max(1,min(REFINE_MAX,(int)(v*REFINE_MAX+0.5f))); return 0; }
+            float dx0,dx1,dy; refine_density_slider(dx0,dx1,dy);              // barra de densidad
+            if(mx>=dx0-8&&mx<=dx1+8&&my>=dy-14&&my<=dy+14){ A.dragging=true; A.dragRegion=25;
+                float v=(mx-dx0)/(dx1-dx0>1?dx1-dx0:1); v=v<0?0:(v>1?1:v);
+                A.refineDensity=v; return 0; }
+            return 0; }
         if(A.listOpen){ float lx,ly,lw,lh; list_rect(lx,ly,lw,lh);   // LISTA de etiquetas: clics dentro del panel
             if(mx>=lx&&mx<=lx+lw&&my>=ly&&my<=ly+lh){
                 if(my<ly+LIST_HH){ A.listSortSize=!A.listSortSize; return 0; }   // cabecera = alterna orden (id / tamano)
@@ -1782,6 +2566,24 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                     if(A.sel<0) A.sel=caja_en(c,r);               // si no habia ninguno seleccionado, selecciona uno para empezar a editar; si ya habia, NO cambia (Editar solo trabaja sobre el seleccionado; Esc o Selec para cambiar)
                     A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.editVert=-1; A.editHole=-1; A.dragging=false;A.dragRegion=0; } }
             else if(A.tool==T_CUT){ A.dragRegion=7; A.cutX.push_back(c); A.cutY.push_back(r); }  // pinta el trazo de corte
+            else if(A.tool==T_ERASER){ A.eraserSnapshot=A.eraserMask; A.eraserDragging=true; A.eraserPrevC=c; A.eraserPrevR=r;
+                eraser_paint(c,r); upload_texture(); A.dragRegion=7; }  // borrador: pinta y arrastra (snapshot para Ctrl+Z)
+            else if(A.tool==T_MERGE){  // UNIR: clic en una etiqueta para seleccionarla/combina
+                int hit=caja_en(c,r);
+                if(hit>=0){
+                    if(A.mergeFirst<0){
+                        A.mergeFirst=hit; A.sel=hit;
+                        std::cout<<"Primera etiqueta seleccionada (#"<<hit<<"). Clic en la segunda para unir.\n";
+                    } else if(hit!=A.mergeFirst){
+                        push_undo();
+                        merge_dets(A.mergeFirst, hit);
+                    } else {
+                        A.mergeFirst=-1; A.sel=-1;
+                        std::cout<<"Seleccion cancelada.\n";
+                    }
+                }
+                A.dragging=false; A.dragRegion=0;
+            }
             else { A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.dragRegion=1; }   // T_SELEC: clic/arrastre selecciona el POLIGONO ENTERO (nunca un vertice)
             }
         else A.dragRegion=4;                                                  // 3D rotar
@@ -1808,7 +2610,15 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
             A.ax[A.scaleAxis]=max(0.4f,min(14.f,A.ax[A.scaleAxis]+(float)proj*0.012f)); }
         else if(A.dragRegion==30){ scroll_center(mx); }                           // barra de scroll horizontal: mueve la ventana
         else if(A.dragRegion==22){ buffer_apply(mx); }                            // modal de buffer
-        else if(A.dragRegion==7){ int c,r; main_to_spec(mx,my,c,r); if(A.cutX.empty()||A.cutX.back()!=c||A.cutY.back()!=r){A.cutX.push_back(c);A.cutY.push_back(r);} }  // pinta trazo de corte
+        else if(A.dragRegion==24){ float tx0,tx1,ty; refine_slider(tx0,tx1,ty);   // modal de refinamiento: radio
+            float v=(mx-tx0)/(tx1-tx0>1?tx1-tx0:1); v=v<0?0:(v>1?1:v);
+            A.refineRadius=max(1,min(REFINE_MAX,(int)(v*REFINE_MAX+0.5f))); }
+        else if(A.dragRegion==25){ float dx0,dx1,dy; refine_density_slider(dx0,dx1,dy);   // densidad
+            float v=(mx-dx0)/(dx1-dx0>1?dx1-dx0:1); v=v<0?0:(v>1?1:v);
+            A.refineDensity=v; }
+        else if(A.dragRegion==7){ int c,r; main_to_spec(mx,my,c,r);
+            if(A.tool==T_ERASER){ if(A.eraserDragging){ eraser_line(A.eraserPrevC,A.eraserPrevR,c,r); A.eraserPrevC=c; A.eraserPrevR=r; upload_texture(); } }
+            else if(A.cutX.empty()||A.cutX.back()!=c||A.cutY.back()!=r){A.cutX.push_back(c);A.cutY.push_back(r);} }  // pinta trazo de corte
         else if(A.dragRegion>=8&&A.dragRegion<=12){ fbar_drag(A.dragRegion,my); }   // barras de filtro / ganancia
         else if(A.dragRegion==21&&A.sel>=0&&A.sel<(int)A.dets.size()){ int c,r; main_to_spec(mx,my,c,r); Det&d=A.dets[A.sel];  // editar forma
             if(d.kind==KIND_POLY&&d.px.size()>=3){                     // POLIGONO: NO rectangularizar
@@ -1832,6 +2642,8 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         bool click=(std::abs(A.dx1-A.dx0)<4&&std::abs(A.dy1-A.dy0)<4);
         if(A.navMode||A.dragRegion==5||A.dragRegion==6){ A.navMode=0; A.scaleAxis=-1; return 0; }  // ventana/divisor/manija eje
         if(A.dragRegion==22){A.dragRegion=0;return 0;}                        // modal de buffer
+        if(A.dragRegion==24){A.dragRegion=0;return 0;}                        // modal de refinamiento (radio)
+        if(A.dragRegion==25){A.dragRegion=0;return 0;}                        // modal de refinamiento (densidad)
         if(A.dragRegion==30){A.dragRegion=0;return 0;}                        // barra de scroll horizontal
         if(A.dragRegion>=8&&A.dragRegion<=12){A.dragRegion=0;return 0;}        // barras de filtro / ganancia
         if(A.dragRegion==21){A.dragRegion=0;A.editVert=-1;A.editHole=-1;return 0;}   // editar
@@ -1845,7 +2657,9 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                         d.px.insert(d.px.begin()+A.pendEdge+1,A.pendEdgeC); d.py.insert(d.py.begin()+A.pendEdge+1,A.pendEdgeR);
                         sync_bbox_from_poly(d); A.dirty=true; A.selDet=A.sel; A.selVert=A.pendEdge+1; A.selVertHole=-1; A.selVerts.clear(); } } }
             A.pendEdge=-1; A.pendEdgeHole=-1; return 0; }
-        if(A.dragRegion==7){ A.dragRegion=0; return 0; }   // corte libre: se sigue pintando; clic-der ejecuta
+        if(A.dragRegion==7){ A.dragRegion=0; A.eraserDragging=false;
+            if(A.eraserMask!=A.eraserSnapshot) push_eraser_undo();   // guarda en historial si la mascara cambio
+            return 0; }   // corte libre / borrador: se sigue pintando
         if(A.dragRegion==1||A.dragRegion==2){ int c0,r0,c1,r1;                 // SELECCION (etiquetar)
             if(A.dragRegion==1){main_to_spec(A.dx0,A.dy0,c0,r0);main_to_spec(mx,my,c1,r1);}
             else{strip_to_spec(A.dx0,A.dy0,c0,r0);strip_to_spec(mx,my,c1,r1);}
@@ -1853,7 +2667,7 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                 push_undo(); Det d; d.kind=KIND_BBOX; d.cls=A.clase_activa; d.x=min(c0,c1);d.y=min(r0,r1);
                 d.w=max(1,std::abs(c1-c0));d.h=max(1,std::abs(r1-r0));
                 d.px={d.x,d.x+d.w,d.x+d.w,d.x};d.py={d.y,d.y,d.y+d.h,d.y+d.h};
-                A.dets.push_back(d); A.sel=(int)A.dets.size()-1; }
+                A.dets.push_back(d); A.sel=(int)A.dets.size()-1; invalidate_dets_caches(); }
             else if(click){ if(A.modo_hilo){A.hilos.push_back(track_hilo(c0,r0)); if(!A.hilos.back().col.empty()){A.sc0=A.hilos.back().col.front();A.sc1=A.hilos.back().col.back();A.sr0=A.sr1=-1;}}
                        else { int hit=caja_en(c0,r0); A.cursor_col=c0;                            // clic simple = selecciona el POLIGONO ENTERO bajo el cursor
                               bool inRect=false;                                                    // ¿el clic cae DENTRO del rectangulo de seleccion vigente?
@@ -1932,11 +2746,11 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         if(cmd>=CLS_BASE&&cmd<NEW_BASE){                    // cambiar etiqueta (clase)
             if(selMenu){ push_undo(); int n=set_class_in_selection(cmd-CLS_BASE);   // a TODOS los poligonos de la seleccion (uno o varios)
                 if(n)std::cout<<"Etiqueta cambiada en "<<n<<" poligonos (seleccion)\n"; else A.undo.pop_back(); }
-            else if(bi>=0){ push_undo(); A.dets[bi].cls=cmd-CLS_BASE; A.dirty=true; } }   // un solo poligono
+            else if(bi>=0){ push_undo(); A.dets[bi].cls=cmd-CLS_BASE; A.dirty=true; invalidate_dets_caches(); } }   // un solo poligono
         else if(cmd>=NEW_BASE)crear_caja(cmd-NEW_BASE);
-        else if(cmd==3&&bi>=0){push_undo();A.dets.erase(A.dets.begin()+bi);A.sel=-1;A.dirty=true;}
+        else if(cmd==3&&bi>=0){push_undo();A.dets.erase(A.dets.begin()+bi);A.sel=-1;A.dirty=true;invalidate_dets_caches();}
         else if(cmd==15&&bigHere>=0){ push_undo(); int nh=(int)A.dets[bigHere].hx.size();   // borra el poligono de FONDO mas grande aqui, con TODOS sus anillos
-            A.dets.erase(A.dets.begin()+bigHere); A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.dirty=true;
+            A.dets.erase(A.dets.begin()+bigHere); A.sel=-1; A.selDet=A.selVert=-1; A.selVerts.clear(); A.dirty=true; invalidate_dets_caches();
             std::cout<<"Borrada la etiqueta de fondo (con "<<nh<<" anillos)\n"; }
         else if(cmd==4)play_drag_sel();
         else if(cmd==5){A.sc0=A.sc1=A.sr0=A.sr1=-1;}
@@ -1963,7 +2777,7 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
             if(bestD>=0){ push_undo(); Det&d=A.dets[bestD];
                 if(bestHole>=0){ if((int)d.hx[bestHole].size()<=3){ d.hx.erase(d.hx.begin()+bestHole); d.hy.erase(d.hy.begin()+bestHole); }
                     else { d.hx[bestHole].erase(d.hx[bestHole].begin()+bestK); d.hy[bestHole].erase(d.hy[bestHole].begin()+bestK); } }
-                else if((int)d.px.size()<=3){ A.dets.erase(A.dets.begin()+bestD); A.sel=-1; }
+                else if((int)d.px.size()<=3){ A.dets.erase(A.dets.begin()+bestD); A.sel=-1; invalidate_dets_caches(); }
                 else { d.px.erase(d.px.begin()+bestK); d.py.erase(d.py.begin()+bestK); sync_bbox_from_poly(d); }
                 A.selDet=A.selVert=-1; A.selVertHole=-1; A.dirty=true; std::cout<<"Vertice borrado (clic der)\n"; }
             return 0; }
@@ -1986,6 +2800,9 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         if(A.listOpen){ float lx,ly,lw,lh; list_rect(lx,ly,lw,lh);   // rueda sobre la LISTA = scroll de la lista
             if(pt.x>=lx&&pt.x<=lx+lw&&pt.y>=ly&&pt.y<=ly+lh){ A.listScroll+=(dz>0?-3:3); if(A.listScroll<0)A.listScroll=0; return 0; } }
         if(A.spec.W>0 && pt.y>=panel_y0()){ scroll_pan(dz>0?-1:1); return 0; }   // rueda sobre el AREA INFERIOR (tira+oscilograma+scroll, donde se ve la ventana) = mueve la ventana de tiempo
+        if(A.tool==T_ERASER&&A.view==1&&A.spec.W>0 && pt.x>=plotX0()-2&&pt.x<=plotX1()+2&&pt.y>=plotY0()-2&&pt.y<=plotY1()+2){
+            if(GetKeyState(VK_CONTROL)&0x8000){ int c,r; main_to_spec(pt.x,pt.y,c,r); zoom2d(dz>0?0.8f:1.25f,c,r); }  // Ctrl+rueda = zoom
+            else A.eraserRadius=max(1,min(50,A.eraserRadius+(dz>0?1:-1))); return 0; }
         if(A.view==1&&A.spec.W>0 && pt.x>=plotX0()-2&&pt.x<=plotX1()+2&&pt.y>=plotY0()-2&&pt.y<=plotY1()+2){   // rueda sobre el espectrograma 2D = ZOOM hacia el cursor
             int c,r; main_to_spec(pt.x,pt.y,c,r); zoom2d(dz>0?0.8f:1.25f,c,r); return 0; }
         A.dist*=(dz>0)?0.9f:1.1f; A.dist=max(0.5f,min(20.f,A.dist)); return 0; }
@@ -2008,6 +2825,7 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
             if(wp==VK_ESCAPE){ A.listOpen=false; A.listSel.clear(); A.listCursor=A.listAnchor=-1; return 0; }
         }
         if((wp=='Z'||wp=='z')&&(GetKeyState(VK_CONTROL)&0x8000)){ do_undo(); return 0; }   // Ctrl+Z = deshacer
+        if((wp=='Y'||wp=='y')&&(GetKeyState(VK_CONTROL)&0x8000)){ do_redo(); return 0; }   // Ctrl+Y = rehacer
         if(wp==VK_DELETE){
             if(A.tool==T_EDIT){                                                       // EDITAR: Supr SOLO borra vertices del poligono seleccionado (nunca la etiqueta entera)
                 push_undo();
@@ -2015,28 +2833,47 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
                 A.undo.pop_back(); return 0; }                                         // nada marcado -> no borra nada
             push_undo();
             if(A.sel>=0&&A.sel<(int)A.dets.size()){                                    // SELECCION: Supr borra la ETIQUETA seleccionada
-                A.dets.erase(A.dets.begin()+A.sel); A.sel=-1; A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.dirty=true;
+                A.dets.erase(A.dets.begin()+A.sel); A.sel=-1; A.selDet=A.selVert=-1; A.selVertHole=-1; A.selVerts.clear(); A.dirty=true; invalidate_dets_caches();
                 std::cout<<"Etiqueta borrada\n"; return 0; }
+            if(A.sc0>=0&&A.sc1>A.sc0){
+                int n=cut_in_selection(); if(n)std::cout<<"Cortadas "<<n<<" etiquetas (seleccion)\n"; else A.undo.pop_back(); return 0; }
             int n=delete_in_selection(); if(n)std::cout<<"Borradas "<<n<<" etiquetas (seleccion)\n"; else A.undo.pop_back(); return 0; }  // sin etiqueta sel.: borra por rectangulo de seleccion (o descarta el snapshot)
         if(wp==VK_ESCAPE){   // Esc: cancela el modo activo; NUNCA cierra la ventana (se sale con 'q')
             if(A.showAbout)A.showAbout=false;                                      // cierra el panel Acerca de
+            else if(A.maskPromptOpen)A.maskPromptOpen=false;                       // cierra el prompt de mascara
             else if(A.cmapOpen)A.cmapOpen=false;                                   // cierra el combo de mapa de color
             else if(A.buffering){ if(A.bufSel>=0&&A.bufSel<(int)A.dets.size())A.dets[A.bufSel]=A.bufOrig; A.autoBuffer=A.bufOrigBuf; A.buffering=false; }  // cancela: restaura
+            else if(A.refining)A.refining=false;
             else if(A.naming)A.naming=false; else if(!A.polyX.empty()){A.polyX.clear();A.polyY.clear();} else if(!A.cutX.empty()){A.cutX.clear();A.cutY.clear();}
             else if(A.tool==T_EDIT){ A.tool=T_SELECT; A.selDet=A.selVert=-1; A.selVerts.clear(); A.editVert=-1; A.editHole=-1; }   // Esc DESACTIVA la edicion
             else { A.selVerts.clear(); A.selDet=A.selVert=-1; A.sc0=A.sc1=A.sr0=A.sr1=-1; }   // limpia marcas/seleccion
-            return 0; } return 0;
+            return 0; }
+        // Ctrl + +/=: agrandar etiqueta seleccionada
+        if((GetKeyState(VK_CONTROL)&0x8000)&&(wp==VK_OEM_PLUS||wp==VK_ADD||wp=='='||wp=='+')){ grow_selected_label(); return 0; }
+        // Ctrl + -: achicar etiqueta seleccionada
+        if((GetKeyState(VK_CONTROL)&0x8000)&&(wp==VK_OEM_MINUS||wp==VK_SUBTRACT||wp=='-')){ shrink_selected_label(); return 0; }
+        // modal refinamiento: +/- ajustan radio
+        if(A.refining&&(wp==VK_OEM_PLUS||wp==VK_ADD||wp=='='||wp=='+')){ A.refineRadius=min(REFINE_MAX,A.refineRadius+1); return 0; }
+        if(A.refining&&(wp==VK_OEM_MINUS||wp==VK_SUBTRACT||wp=='-')){ A.refineRadius=max(1,A.refineRadius-1); return 0; }
+        return 0;
     case WM_CHAR:
         if(A.buffering){ if((int)wp==13)A.buffering=false; return 0; }   // Enter = aplicar buffer
+        if(A.refining){ if((int)wp==13){ apply_refine(); A.refining=false; } return 0; }   // Enter = aplicar refinamiento
         if(A.naming){ int ch=(int)wp;
             if(ch==13){ if(!A.nameBuf.empty())add_class(A.nameBuf); A.naming=false; layout_botones(); }
             else if(ch==27)A.naming=false;
             else if(ch==8){ if(!A.nameBuf.empty())A.nameBuf.pop_back(); }
             else if(ch>=32&&ch<127&&(int)A.nameBuf.size()<24)A.nameBuf.push_back((char)ch);
             return 0; }
-        if((int)wp==26){ do_undo(); return 0; }   // Ctrl+Z llega como WM_CHAR 0x1A
+        // Ctrl + +: agrandar etiqueta
+        if((GetKeyState(VK_CONTROL)&0x8000)&&((int)wp=='+'||(int)wp=='=')){ grow_selected_label(); return 0; }
+        // Ctrl + -: achicar etiqueta
+        if((GetKeyState(VK_CONTROL)&0x8000)&&(int)wp=='-'){ shrink_selected_label(); return 0; }
         if((int)wp==13){ if(!A.polyX.empty())finish_poly(); return 0; }   // Enter cierra el poligono a mano
         do_action((int)wp); return 0;
+    case WM_CLOSE:
+        if(A.spec.W>0){ close_audio(); return 0; }   // hay audio: cerrar audio, mantener ventana
+        PLAYER.stop(); DestroyWindow(h); return 0;    // sin audio: cerrar programa
     case WM_DESTROY: PLAYER.stop(); PostQuitMessage(0); return 0;
     }
     return DefWindowProc(h,m,wp,lp);
@@ -2057,7 +2894,7 @@ int main(int argc,char**argv){
     DragAcceptFiles(hwnd,TRUE);   // habilita ARRASTRAR Y SOLTAR un WAV sobre la ventana (WM_DROPFILES)
     if(argc>=2) load_audio(argv[1]);
     if(argc>=4){ A.yaw=(float)atof(argv[3]); A.view=2; layout_botones(); }   // (preview) yaw inicial + vista 3D
-    if(argc>=5){ A.dbMin=(float)atof(argv[4]); upload_texture(); }            // (preview) piso dB para ralear la superficie
+    if(argc>=5){ A.dbMin=(float)atof(argv[4]); upload_texture(); eraser_reset_if_filter_changed(); }  // (preview) piso dB para ralear la superficie
     if(argc>=6){ A.pitch=(float)atof(argv[5]); }                              // (preview) pitch inicial
     MSG msg; bool run=true;
     int rfc=0;
