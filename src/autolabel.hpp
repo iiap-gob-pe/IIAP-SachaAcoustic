@@ -332,6 +332,26 @@ inline Mask multires_detect(const Img& e, float K, int n_scales) {
     return fused;
 }
 
+// Suavizado de Chaikin: subdivide cada segmento en 2 puntos a 1/4 y 3/4,
+// produciendo curvas suaves a partir de poligonos angulares.
+// iters: numero de iteraciones (1 = suficiente para la mayoria de los casos).
+inline void chaikin_smooth(std::vector<int>& px, std::vector<int>& py, int iters = 1) {
+    if (px.size() < 3) return;
+    for (int iter = 0; iter < iters; ++iter) {
+        int n = (int)px.size();
+        std::vector<int> nx, ny;
+        for (int i = 0; i < n; ++i) {
+            int j = (i + 1) % n;
+            nx.push_back((3 * px[i] + px[j]) / 4);
+            ny.push_back((3 * py[i] + py[j]) / 4);
+            nx.push_back((px[i] + 3 * px[j]) / 4);
+            ny.push_back((py[i] + 3 * py[j]) / 4);
+        }
+        px = std::move(nx);
+        py = std::move(ny);
+    }
+}
+
 // e: espectrograma realzado 0..1. K: estrictez de ruido. area_min: descarta
 // manchas pequenas. make_poly: true -> contorno (poligono); false -> rectangulo
 // (bounding box). buffer: dilatacion extra (px) que UNE detecciones cercanas y deja
@@ -339,11 +359,14 @@ inline Mask multires_detect(const Img& e, float K, int n_scales) {
 // n_bands: bandas para umbral adaptativo. multires: analisis multi-resolucion.
 // adaptive_morph: morfologia adaptativa. min_persistence: frames minimos para tracking.
 // min_neighbors: vecinos minimos para filtro de densidad (0 = desactivado).
+// island_sep: separacion minima entre islas (px). Si 2 componentes estan unidos por
+// un puente mas delgado que 2*island_sep+1, se separan. 0 = desactivado.
 inline std::vector<Det> auto_label(const Img& e_in, float K = 4.5f, int area_min = 60,
                                    bool make_poly = true, int buffer = 0,
                                    int n_bands = 8, bool multires = true,
                                    int n_scales = 3, bool adaptive_morph = true,
-                                   int min_persistence = 2, int min_neighbors = 2) {
+                                   int min_persistence = 2, int min_neighbors = 2,
+                                   int island_sep = 2) {
     const int W = e_in.W, H = e_in.H;
     Img e = smooth3x3(e_in);              // suavizado previo (robustez al ruido)
 
@@ -402,61 +425,126 @@ inline std::vector<Det> auto_label(const Img& e_in, float K = 4.5f, int area_min
         dilate_into(buf_a, mask, W, H, 9, 3);      // close
     }
 
-    if (buffer > 0) {                     // BUFFER: une detecciones cercanas + margen
-        int k = 2 * buffer + 1;
-        dilate_into(mask, buf_a, W, H, k, k);  // (sin erosionar -> deja el margen "buffer")
-        mask = buf_a;
+    // --- Fase 4: Separación de islas (romper puentes delgados) ---
+    // Apertura para encontrar componentes separados. La máscara resultante
+    // se usa SOLO para determinar qué píxeles pertenecen a qué componente.
+    // Los contornos se trazan sobre la máscara ORIGINAL (antes de la apertura)
+    // para capturar TODOS los píxeles de cada forma.
+    Mask separated((size_t)W * H, 0);
+    if (island_sep > 0) {
+        int ek = 2 * island_sep + 1;
+        erode_into(mask, buf_a, W, H, ek, ek);
+        dilate_into(buf_a, separated, W, H, ek, ek);   // apertura → separación
+    } else {
+        separated = mask;   // sin separación: usar la máscara tal cual
     }
 
-    // --- Fase 4: Filtro de densidad (quitar partículas dispersas) ---
-    if (min_neighbors > 0) remove_sparse_pixels(mask, W, H, 1, min_neighbors);
+    // --- Fase 5: Filtro de densidad (quitar partículas dispersas) ---
+    if (min_neighbors > 0) remove_sparse_pixels(separated, W, H, 1, min_neighbors);
 
-    int dec = std::max(3, 3 + buffer * 2);// decimado del contorno (mas grueso con buffer)
+    int dec = std::max(3, 3 + buffer * 2);
 
-    // componentes conexos (BFS 8-vec)
+    // --- Fase 6: Encontrar componentes en la máscara SEPARADA ---
     std::vector<int> lab((size_t)W * H, 0);
-    std::vector<Det> dets;
     int next = 0;
     const int dx8[8] = {1, 1, 0, -1, -1, -1, 0, 1};
     const int dy8[8] = {0, 1, 1, 1, 0, -1, -1, -1};
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
-            if (!mask[y * W + x] || lab[y * W + x]) continue;
+            if (!separated[y * W + x] || lab[y * W + x]) continue;
             ++next;
-            int minx = x, maxx = x, miny = y, maxy = y, area = 0;
             std::queue<std::pair<int, int>> q;
             q.push({x, y}); lab[y * W + x] = next;
             while (!q.empty()) {
-                auto [cx, cy] = q.front(); q.pop(); ++area;
-                minx = std::min(minx, cx); maxx = std::max(maxx, cx);
-                miny = std::min(miny, cy); maxy = std::max(maxy, cy);
+                auto [cx, cy] = q.front(); q.pop();
                 for (int k = 0; k < 8; ++k) {
                     int nx = cx + dx8[k], ny = cy + dy8[k];
                     if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
-                    if (mask[ny * W + nx] && !lab[ny * W + nx]) {
+                    if (separated[ny * W + nx] && !lab[ny * W + nx]) {
                         lab[ny * W + nx] = next; q.push({nx, ny});
                     }
                 }
             }
-            if (area < area_min) continue;
-            Det d;
-            d.x = minx; d.y = miny; d.w = maxx - minx + 1; d.h = maxy - miny + 1;
-            int cy = d.y + d.h / 2;
-            d.cls = (cy > 0.75 * H) ? CLASE_ANTRO : CLASE_BIO;
-            if (make_poly) {                 // poligono: contorno trazado y decimado
-                d.kind = KIND_POLY;
-                std::vector<int> bx, by;
-                trace_boundary(lab, W, H, next, x, y, bx, by);
-                for (size_t i = 0; i < bx.size(); i += dec) { d.px.push_back(bx[i]); d.py.push_back(by[i]); }
-                if (d.px.size() < 3) { d.px = {d.x, d.x + d.w, d.x + d.w, d.x};
-                    d.py = {d.y, d.y, d.y + d.h, d.y + d.h}; }
-                else find_holes(mask, W, H, minx, miny, maxx, maxy, dec, std::max(8, area_min / 4), d.hx, d.hy);  // ANILLOS: huecos internos
-            } else {                         // bounding box (rectangulo)
-                d.kind = KIND_BBOX;
-                d.px = {d.x, d.x + d.w, d.x + d.w, d.x};
-                d.py = {d.y, d.y, d.y + d.h, d.y + d.h};
-            }
-            dets.push_back(std::move(d));
         }
+
+    // --- Fase 7: Re-expandir etiquetas sobre la máscara ORIGINAL ---
+    // Cada componente de separated "reclama" píxeles en mask (original) que
+    // estén conectados a él pero NO reclamados por otro componente. Los puentes
+    // en mask se asignan al componente más cercano, evitando que dos formas se mezclen.
+    for (int label_id = 1; label_id <= next; ++label_id) {
+        // Encontrar bbox del componente en separated
+        int lx0 = W, lx1 = 0, ly0 = H, ly1 = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (lab[y * W + x] == label_id) {
+                    lx0 = std::min(lx0, x); lx1 = std::max(lx1, x);
+                    ly0 = std::min(ly0, y); ly1 = std::max(ly1, y);
+                }
+        // Flood-fill en mask (original) desde los píxeles del componente,
+        // reclamando solo píxeles no etiquetados
+        for (int y = ly0; y <= ly1; ++y)
+            for (int x = lx0; x <= lx1; ++x) {
+                if (!mask[y * W + x] || lab[y * W + x]) continue;
+                bool adj = false;
+                for (int k = 0; k < 8 && !adj; ++k) {
+                    int nx = x + dx8[k], ny = y + dy8[k];
+                    if (nx >= 0 && nx < W && ny >= 0 && ny < H && lab[ny * W + nx] == label_id)
+                        adj = true;
+                }
+                if (!adj) continue;
+                std::queue<std::pair<int, int>> q;
+                q.push({x, y}); lab[y * W + x] = label_id;
+                while (!q.empty()) {
+                    auto [cx, cy] = q.front(); q.pop();
+                    for (int k = 0; k < 8; ++k) {
+                        int nx = cx + dx8[k], ny = cy + dy8[k];
+                        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+                        if (mask[ny * W + nx] && !lab[ny * W + nx]) {
+                            lab[ny * W + nx] = label_id; q.push({nx, ny});
+                        }
+                    }
+                }
+            }
+    }
+
+    // --- Fase 8: Generar detecciones con contornos completos ---
+    std::vector<Det> dets;
+    for (int label_id = 1; label_id <= next; ++label_id) {
+        int minx = W, maxx = 0, miny = H, maxy = 0, area = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (lab[y * W + x] == label_id) {
+                    minx = std::min(minx, x); maxx = std::max(maxx, x);
+                    miny = std::min(miny, y); maxy = std::max(maxy, y);
+                    ++area;
+                }
+        if (area < area_min) continue;
+        Det d;
+        d.x = minx; d.y = miny; d.w = maxx - minx + 1; d.h = maxy - miny + 1;
+        int cy = d.y + d.h / 2;
+        d.cls = (cy > 0.75 * H) ? CLASE_ANTRO : CLASE_BIO;
+        if (make_poly) {
+            d.kind = KIND_POLY;
+            std::vector<int> bx, by;
+            // Buscar un pixel semilla dentro de este componente
+            int sx = -1, sy = -1;
+            for (int y = miny; y <= maxy && sx < 0; ++y)
+                for (int x = minx; x <= maxx && sx < 0; ++x)
+                    if (lab[y * W + x] == label_id) { sx = x; sy = y; }
+            if (sx >= 0) trace_boundary(lab, W, H, label_id, sx, sy, bx, by);
+            for (size_t i = 0; i < bx.size(); i += dec) { d.px.push_back(bx[i]); d.py.push_back(by[i]); }
+            if (d.px.size() < 3) { d.px = {d.x, d.x + d.w, d.x + d.w, d.x};
+                d.py = {d.y, d.y, d.y + d.h, d.y + d.h}; }
+            else {
+                chaikin_smooth(d.px, d.py, 1);
+                find_holes(mask, W, H, minx, miny, maxx, maxy, dec, std::max(8, area_min / 4), d.hx, d.hy);
+            }
+        } else {
+            d.kind = KIND_BBOX;
+            d.px = {d.x, d.x + d.w, d.x + d.w, d.x};
+            d.py = {d.y, d.y, d.y + d.h, d.y + d.h};
+        }
+        dets.push_back(std::move(d));
+    }
     return dets;
 }

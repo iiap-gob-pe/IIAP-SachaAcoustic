@@ -60,6 +60,7 @@ struct AppS {
     float gain = 1.0f;               // ganancia de reproduccion (1=normalizado; >1 sube mas)
     float playSpeed = 1.0f;          // velocidad de reproduccion (1.0x); <1 lento+grave (expansion temporal), >1 rapido
     bool hide_labels = false;        // ocultar etiquetas (cajas/poligonos) del dibujo
+    bool show_mask = true;           // mostrar/ocultar efecto de la mascara del borrador en el espectrograma
     float volFLo=0.f, volFHi=1.f, volDbMin=0.f, volDbMax=1.f;  // filtros LOCALES de la vista Volumen
     std::vector<int> polyX, polyY;   // poligono en construccion (modo poligono a mano)
     std::vector<int> cutX, cutY;     // trazo de corte LIBRE (modo Cortar); clic-der ejecuta
@@ -67,6 +68,7 @@ struct AppS {
     bool dirty = false;              // hay cambios sin guardar -> autosave
     unsigned long long lastSig = 0; bool sigInit = false;   // firma de etiquetas para autosave
     bool buffering = false; int bufSel = -1; Det bufOrig; int bufOrigBuf = 0;  // modal de buffer (con copia para cancelar)
+    bool refining = false; int refineRadius = 2; float refineDensity = 0.15f;   // modal de refinamiento: radio + densidad minima
     int editVert = -1;               // poligono: vertice en edicion ; bbox: 100+manija, 108 mover
     int editHole = -1;               // editar: -1 = contorno exterior ; >=0 = indice del HUECO/anillo en edicion
     int lastEditC = 0, lastEditR = 0;// ultima posicion (spec) al mover un poligono (para trasladar)
@@ -149,6 +151,10 @@ struct AppS {
     std::vector<Boton> botones;
     std::string out_dir = ".";
     std::string fname = "(sin archivo)";   // nombre del WAV cargado
+
+    // --- prompt de mascara al arrastrar BMP ---
+    bool maskPromptOpen = false;            // hay un dialogo de confirmacion de mascara abierto
+    std::string maskPromptPath;             // path del BMP que se intento arrastrar
 };
 static AppS A;
 static AudioPlayer PLAYER;
@@ -160,6 +166,7 @@ static bool g_dialogOpen = false;                       // hay un dialogo Abrir/
 static void show_busy(const std::string& msg);         // indicador de carga (def. mas abajo)
 static void layout_botones();                           // (def. mas abajo) recalcula barra/paleta
 static unsigned long long labels_sig();                 // (def. mas abajo) firma de etiquetas (autosave)
+static void guardar(bool silent);                         // (def. mas abajo) guardar etiquetas COCO+Raven
 // Invalida TODOS los flags de cache dependientes de A.dets.
 // Llamar despues de cualquier mutacion de A.dets (push_back, erase, asignacion, etc.)
 static void invalidate_dets_caches() {
@@ -207,6 +214,7 @@ static float& flt_dbMax(){ return A.view==7?A.volDbMax:A.dbMax; }
 static void spec_to_main(float c,float r,float&sx,float&sy);   // def. mas abajo
 static void sync_bbox_from_poly(Det&d);                        // def. mas abajo
 static void push_undo();                                       // (def. mas abajo) snapshot para Ctrl+Z
+static void push_eraser_undo();                                // (def. mas abajo) snapshot de mascara para Ctrl+Z
 static bool list_is_sel(int i);                                // (def. mas abajo) ¿el det i esta en la seleccion de la LISTA?
 // modal de buffer: rectangulo de la pista del slider {tx0,tx1,ty}
 static void bufslider(float& tx0,float& tx1,float& ty){ float w=400,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-45;
@@ -257,6 +265,7 @@ static size_t next_pow2(size_t n){ size_t p=1; while(p<n) p<<=1; return p; }
 // filtro: pasa si freq-fraccion en [fLo,fHi] y energia >= dbMin
 static bool pass_filt(float f,float e){ return f>=A.fLo && f<=A.fHi && e>=A.dbMin && e<=A.dbMax; }
 static void upload_texture();   // forward declaration (def. mas abajo)
+static bool load_mask_from_path(const std::string& path);   // forward declaration (def. mas abajo)
 
 // ---- borrador temporal ----
 static void eraser_init(){
@@ -380,7 +389,7 @@ static void build_env(){ A.envMin.assign(A.NB,0); A.envMax.assign(A.NB,0);
 
 // ---------------- carga ----------
 static void upload_texture(){ int W=A.enh.W,H=A.enh.H; RGBImg c(W,H);
-    bool hasMask=!A.eraserMask.empty();
+    bool hasMask=!A.eraserMask.empty() && A.show_mask;
     for(int r=0;r<H;++r){ float f=(float)(H-1-r)/(H-1);
         for(int x=0;x<W;++x){ float e=A.enh.at(r,x); size_t i=((size_t)r*W+x)*3;
             if(pass_filt(f,e) && (!hasMask||A.eraserMask[r*W+x]==0)){
@@ -404,6 +413,7 @@ static bool pt_in_det(const Det& d,float x,float y){
         for(size_t k=0;k<d.hx.size();++k) if(d.hx[k].size()>=3&&pt_in_poly(d.hx[k],d.hy[k],x,y))return false; return true; }
     return (x>=d.x&&x<d.x+d.w&&y>=d.y&&y<d.y+d.h); }
 
+
 // cierra el poligono en construccion como un Det de la clase activa
 static void finish_poly(){ if(A.polyX.size()<3){A.polyX.clear();A.polyY.clear();return;}
     push_undo();
@@ -413,6 +423,8 @@ static void finish_poly(){ if(A.polyX.size()<3){A.polyX.clear();A.polyY.clear();
     d.x=mnx;d.y=mny;d.w=max(1,mxx-mnx);d.h=max(1,mxy-mny);
     A.dets.push_back(std::move(d)); A.sel=(int)A.dets.size()-1; A.polyX.clear();A.polyY.clear(); invalidate_dets_caches(); }
 static bool load_audio(const std::string& path){ try{
+    PLAYER.stop();                                                              // detener reproduccion del audio anterior
+    A.maskPromptOpen=false;                                                     // cerrar prompt de mascara si estaba abierto
     { size_t p=path.find_last_of("/\\"); show_busy(std::string("Cargando ")+((p==std::string::npos)?path:path.substr(p+1))+" ..."); }
     A.audio=load_wav(path); A.sr=A.audio.sample_rate;
     // RENDIMIENTO: para audios LARGOS o de alta frecuencia (ultrasonico), el espectrograma
@@ -428,7 +440,7 @@ static bool load_audio(const std::string& path){ try{
     A.enh=enhance_asinh(A.spec,0.07); A.dets.clear(); invalidate_dets_caches();  // NO auto-etiquetar al cargar (lo hace el boton Auto)
     A.hilos.clear(); A.sel=-1; A.sc0=A.sc1=A.sr0=A.sr1=-1; A.cursor_col=0; A.polyX.clear(); A.polyY.clear(); A.cutX.clear(); A.cutY.clear(); A.selDet=A.selVert=-1; A.selVerts.clear(); A.rbDrag=false;
     A.listSel.clear(); A.listCursor=A.listAnchor=-1; A.listScroll=0;   // lista de etiquetas: reset
-    A.vr0=0; A.vr1=A.spec.H; A.sigInit=false; A.dirty=false; A.undo.clear();   // ventana freq completa + base de autosave + limpia historial
+    A.vr0=0; A.vr1=A.spec.H; A.sigInit=false; A.dirty=false; A.undo.clear(); A.redo.clear(); A.eraserSnapshot.clear();   // ventana freq completa + base de autosave + limpia historial
     A.vc0=0; A.vc1=A.spec.W;                                   // ventana = todo el audio
     // al cargar un audio NUEVO: reinicia TODOS los filtros a su valor por defecto y vuelve a la vista 2D
     A.fLo=0.f; A.fHi=1.f; A.dbMin=0.f; A.dbMax=1.f;            // filtros GLOBALES (freq + dB) a default
@@ -446,17 +458,10 @@ static bool load_audio(const std::string& path){ try{
       if(tf.good()){ tf.close(); std::vector<Det> in=import_coco(jp,A.classes);
         if(!in.empty()){ A.dets=in; if(A.clase_activa>=(int)A.classes.size())A.clase_activa=0; layout_botones(); invalidate_dets_caches();
           std::cout<<"Etiquetas cargadas de "<<jp<<": "<<in.size()<<"\n"; } } }
-    // auto-cargar mascara de fondo si existe <nombre_audio>_mask.bmp
+    // auto-cargar mascara guardada: si en out_dir existe <nombre_audio>_mask.bmp, cargarla
     { std::string stem=A.fname; size_t dp=stem.find_last_of('.'); if(dp!=std::string::npos)stem=stem.substr(0,dp);
-      std::string mp=A.out_dir+"/"+stem+"_mask.bmp"; RGBImg mask=read_bmp(mp);
-      if(mask.W>0&&mask.H>0&&mask.W==A.spec.W&&mask.H==A.spec.H){
-          A.eraserMask.resize((size_t)mask.W*mask.H);
-          for(int r=0;r<mask.H;++r) for(int c=0;c<mask.W;++c){
-              size_t i=((size_t)r*mask.W+c)*3;
-              A.eraserMask[r*mask.W+c]=(mask.d[i]>128||mask.d[i+1]>128||mask.d[i+2]>128)?1:0; }
-          A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
-          upload_texture();
-          std::cout<<"Mascara de fondo cargada: "<<mp<<"\n"; } }
+      std::string mp=A.out_dir+"/"+stem+"_mask.bmp"; std::ifstream mf(mp.c_str());
+      if(mf.good()){ mf.close(); load_mask_from_path(mp); } }
     // LIMPIEZA DEFENSIVA: descarta anillos mal ubicados (centroide FUERA del exterior) -> artefactos
     // del bug viejo de coords (anillos en la esquina sup-izq, fuera de su etiqueta). Tambien quita huecos degenerados.
     { int removed=0; for(auto&d:A.dets){ if(d.kind!=KIND_POLY||d.px.size()<3){ d.hx.clear(); d.hy.clear(); continue; }
@@ -468,6 +473,36 @@ static bool load_audio(const std::string& path){ try{
     A.lastSig=labels_sig(); A.sigInit=true;   // base del autosave = estado recien cargado
     std::cout<<"Cargado "<<path<<": "<<A.spec.W<<"x"<<A.spec.H<<", "<<A.dets.size()<<" det, "<<A.rios.size()<<" crestas\n";
     return true;}catch(const std::exception&e){std::cerr<<"Error: "<<e.what()<<"\n";return false;} }
+// Cierra el audio actual y resetea toda la estado a "sin archivo".
+// La ventana permanece abierta para poder abrir otro WAV.
+static void close_audio(){
+    PLAYER.stop();
+    if(A.dirty&&A.spec.W>0&&A.fname!="(sin archivo)") guardar(true);   // auto-guardar antes de cerrar
+    A.audio=AudioData(); A.sr=0;
+    A.spec=Img(); A.enh=Img();
+    A.dets.clear(); A.hilos.clear(); A.rios.clear(); A.picos.clear();
+    A.envMin.clear(); A.envMax.clear();
+    A.fname="(sin archivo)"; A.dirty=false;
+    A.undo.clear(); A.redo.clear(); A.undoKind.clear(); A.redoKind.clear();
+    A.eraserUndo.clear(); A.eraserRedo.clear(); A.eraserSnapshot.clear(); A.eraserMask.clear();
+    A.labelMask.clear(); A.maskDirty=true;
+    A.cachedListOrder.clear(); A.listOrderDirty=true;
+    A.listSelBitmap.clear(); A.listSelDirty=true;
+    A.listSel.clear(); A.listCursor=A.listAnchor=-1; A.listScroll=0;
+    A.sc0=A.sc1=A.sr0=A.sr1=-1; A.cursor_col=0;
+    A.polyX.clear(); A.polyY.clear(); A.cutX.clear(); A.cutY.clear();
+    A.selDet=A.selVert=-1; A.selVerts.clear(); A.sel=-1;
+    A.vr0=0; A.vr1=0; A.vc0=0; A.vc1=0;
+    A.sigInit=false;
+    invalidate_dets_caches();
+    // subir textura vacia (pantalla negra)
+    RGBImg blank(1,1);
+    if(!A.tex)glGenTextures(1,&A.tex);
+    glBindTexture(GL_TEXTURE_2D,A.tex); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR); glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGB,1,1,0,GL_RGB,GL_UNSIGNED_BYTE,blank.d.data());
+    std::cout<<"Audio cerrado.\n";
+}
 // RESOLUCION GLOBAL (botones/teclas Res- y Res+): recalcula el espectrograma con un HOP
 // distinto (resolucion TEMPORAL). dir>0 = MAS fino (hop menor -> mas columnas); dir<0 = MAS
 // grueso. Afecta la vista 2D (textura) Y todas las vistas 3D (derivan de A.enh). Reescala las
@@ -613,7 +648,7 @@ static void layout_botones(){
     struct Bdef{ const char* label; int key; int icon; int when; const char* tip; };  // when: 0=siempre, else vista
     static const Bdef defs[]={
         // --- Archivo ---
-        {"",'o',0,0,"Abrir archivo WAV"},{"Cargar",'R',-1,0,"Cargar etiquetas Raven (.txt selection table)"},{"",'s',7,0,"Guardar (COCO .json + Raven .txt)"},
+        {"",'o',0,0,"Abrir archivo WAV"},        {"Cargar",'R',-1,0,"Cargar etiquetas Raven (.txt) o mascara de fondo (_mask.bmp)"},{"",'s',7,0,"Guardar (COCO .json + Raven .txt)"},
         {0,0,0,0,0},
         // --- Vistas ---
         {"2D",'1',-1,0,"Vista espectrograma 2D"},{"3D",'2',-1,0,"Vista terreno 3D"},
@@ -646,12 +681,14 @@ static void layout_botones(){
         {"Ocultar",'O',-1,0,"Ocultar / mostrar las etiquetas"},
         {"Lista",'L',-1,0,"Lista de TODAS las etiquetas: clic=selecciona (resalta en 2D); cabecera ordena por tamano; Supr/clic-der borra; Ctrl/Shift/flechas = multiseleccion"},
         {"Limpiar",'c',-1,0,"Borrar TODAS las etiquetas"},
-        {"Masc",'K',-1,0,"Exportar mascara de fondo (BMP: blanco=fondo, negro=senal)"},
+        {"Masc",'K',-1,0,"Exportar mascara de fondo (BMP: blanco=fondo, negro=senal). Muestra animacion de carga"},
+        {"Afinar",'F',-1,0,"Afinar espectrograma: elimina residuos con opening morfológico (se resalta si esta activo)"},
+        {"VerMask",'h',-1,0,"Mostrar / ocultar la mascara del borrador (se resalta si esta activa)"},
         {0,0,0,0,0},
         // --- 3D ---
         {"Res-",'[',-1,0,"Menos resolucion (toda vista: recalcula espectro + 3D)"},{"Res+",']',-1,0,"Mas resolucion (toda vista: recalcula espectro + 3D)"},
         {"Crestas",'H',-1,3,"Crestas completas: muestra el hilo entero si algun punto pasa el filtro"},  // solo vista Rio (V3)
-        {"Glifos",'G',-1,6,"Glifos completos: dibuja todos los palos del hilo si algun punto pasa el filtro"}, // solo Quiver (V6)
+        {"Glifos",'Q',-1,6,"Glifos completos: dibuja todos los palos del hilo si algun punto pasa el filtro"}, // solo Quiver (V6)
         {0,0,0,0,0},
         // --- Info ---
         {"Acerca",'?',-1,0,"Acerca de / Contacto: creador, IIAP, y para que sirve el software"},
@@ -703,7 +740,7 @@ static void show_busy(const std::string& msg){ if(!g_hdc)return;
     SwapBuffers(g_hdc); }
 // espectro restringido al filtro actual (freq+dB): para auto-segmentar SOLO lo visible
 static Img filtered_spec(){ Img s=A.spec; int W=A.spec.W,H=A.spec.H;
-    bool hasMask=!A.eraserMask.empty();
+    bool hasMask=!A.eraserMask.empty() && A.show_mask;
     for(int r=0;r<H;++r){ float f=(float)(H-1-r)/(H-1);
         for(int c=0;c<W;++c){ float e=A.enh.at(r,c);
             if(!pass_filt(f,e)||(hasMask&&A.eraserMask[r*W+c])) s.at(r,c)=0.f; } }
@@ -756,6 +793,72 @@ static void buffer_apply(int mx){ float tx0,tx1,ty; bufslider(tx0,tx1,ty);
     float v=(mx-tx0)/(tx1-tx0>1?tx1-tx0:1); v=v<0?0:(v>1?1:v);
     A.autoBuffer=(int)(v*BUF_MAX+0.5f);
     if(A.bufSel>=0&&A.bufSel<(int)A.dets.size()){ A.dets[A.bufSel]=A.bufOrig; improve_det(A.bufSel); invalidate_dets_caches(); } }
+
+// --- refinamiento: slider y aplicar ---
+static const int REFINE_MAX = 8;   // radio maximo del opening
+static void refine_slider(float& tx0,float& tx1,float& ty){ float w=400,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-45;
+    tx0=x+24; tx1=x+w-24; ty=y+56; }
+static void refine_density_slider(float& tx0,float& tx1,float& ty){ float w=400,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-45;
+    tx0=x+24; tx1=x+w-24; ty=y+76; }
+static void apply_refine(){
+    if(A.spec.W<1) return;
+    int W=A.spec.W, H=A.spec.H;
+    int c0=A.vc0, c1=A.vc1; if(c1<=c0){c0=0; c1=W;}
+    int r0=A.vr0, r1=A.vr1; if(r1<=r0){r0=0; r1=H;}
+    int rw=c1-c0, rh=r1-r0; if(rw<3||rh<3) return;
+    // 1. Crear máscara binaria de la región visible: 1=señal (pasa filtro), 0=fondo
+    Mask vis((size_t)rw*rh, 0);
+    bool hasMask=!A.eraserMask.empty();
+    for(int r=r0;r<r1;++r){ float f=(float)(H-1-r)/(H-1);
+        for(int c=c0;c<c1;++c){ float e=A.enh.at(r,c);
+            if(pass_filt(f,e) && (!hasMask||A.eraserMask[r*W+c]==0))
+                vis[(size_t)(r-r0)*rw+(c-c0)] = 1; } }
+    // 2. Filtro de densidad: para cada píxel, contar píxeles activos en una ventana
+    //    amplia (2*rad+1). Si la densidad (activos/total) < refineDensity, eliminar.
+    //    Esto quita bloques de ruido que están cerca de la forma pero no son parte de ella.
+    int rad = A.refineRadius;
+    int minN = max(1, rad);
+    int cleanRad = max(rad, 3);   // ventana para densidad: al menos 3 para tener sentido
+    float densityThr = A.refineDensity;
+    int cleaned = 0;
+    if(hasMask || A.eraserMask.empty()) A.eraserMask.resize((size_t)W*H);
+    for(int rr=0;rr<rh;++rr){
+        for(int cc=0;cc<rw;++cc){
+            if(vis[rr*rw+cc]==0) continue;
+            // Filtro 1: conteo de vecinos (aislamiento)
+            int cnt=0;
+            for(int dr=-rad;dr<=rad&&cnt<minN;++dr){
+                for(int dc=-rad;dc<=rad&&cnt<minN;++dc){
+                    if(dr==0&&dc==0) continue;
+                    int nr=rr+dr, nc=cc+dc;
+                    if(nr>=0&&nr<rh&&nc>=0&&nc<rw&&vis[nr*rw+nc]) ++cnt;
+                }
+            }
+            if(cnt<minN){  // muy pocas señales vecinas → residuo aislado
+                int gr=r0+rr, gc=c0+cc;
+                if(A.eraserMask[gr*W+gc]==0){ A.eraserMask[gr*W+gc]=1; ++cleaned; }
+                continue;
+            }
+            // Filtro 2: densidad en ventana amplia
+            int total=0, active=0;
+            for(int dr=-cleanRad;dr<=cleanRad;++dr){
+                for(int dc=-cleanRad;dc<=cleanRad;++dc){
+                    int nr=rr+dr, nc=cc+dc;
+                    if(nr>=0&&nr<rh&&nc>=0&&nc<rw){
+                        ++total;
+                        if(vis[nr*rw+nc]) ++active;
+                    }
+                }
+            }
+            if(total>0 && (float)active/(float)total < densityThr){
+                int gr=r0+rr, gc=c0+cc;
+                if(A.eraserMask[gr*W+gc]==0){ A.eraserMask[gr*W+gc]=1; ++cleaned; }
+            }
+        }
+    }
+    A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+    upload_texture(); push_eraser_undo();
+    std::cout<<"Afinado: "<<cleaned<<" residuos eliminados (radio="<<A.refineRadius<<", minVecinos="<<minN<<", densidad="<<densityThr<<")\n"; }
 
 static void draw_tex_quad(float x0,float y0,float x1,float y1,float u0=0.f,float u1=1.f,float v0=0.f,float v1=1.f){
     glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,A.tex); glColor3f(1,1,1);
@@ -1166,10 +1269,12 @@ static void render_toolbar(){ ortho2d();
         if(b.key=='1'+A.view-1)on=true; if(b.key=='B'&&A.solo_banda)on=true;
         if(b.key=='k'&&PLAYER.paused)on=true;
         if(b.key=='H'&&A.rio_completo)on=true;
-        if(b.key=='G'&&A.quiver_completo)on=true;
+        if(b.key=='Q'&&A.quiver_completo)on=true;
         if(b.key=='S'&&A.tool==T_SELECT)on=true;
         if(b.key=='Y'&&A.tool==T_BBOX)on=true; if(b.key=='P'&&A.tool==T_POLY)on=true;
         if(b.key=='X'&&A.tool==T_CUT)on=true; if(b.key=='J'&&A.tool==T_MERGE)on=true; if(b.key=='d'&&A.tool==T_ERASER)on=true;
+        if(b.key=='h'&&A.show_mask)on=true;
+        if(b.key=='F'&&A.refining)on=true;
         if(b.key=='O'&&A.hide_labels)on=true; if(b.key=='L'&&A.listOpen)on=true;
         if(on)glColor3f(0.25f,0.45f,0.65f);else glColor3f(0.20f,0.20f,0.24f);
         glBegin(GL_QUADS);glVertex2f(b.x,b.y);glVertex2f(b.x+b.w,b.y);glVertex2f(b.x+b.w,b.y+b.h);glVertex2f(b.x,b.y+b.h);glEnd();
@@ -1414,6 +1519,23 @@ static void render_naming(){ if(!A.naming)return; ortho2d();
     glColor3f(1,1,1);FONT.at2d(x+10,y+18,"Nueva etiqueta (Enter=ok, Esc=cancela):");
     FONT.at2d(x+10,y+42,A.nameBuf+"_"); }
 
+// overlay de confirmacion al arrastrar una mascara BMP que no coincide con el audio
+static void render_mask_prompt(){ if(!A.maskPromptOpen)return; ortho2d();
+    float w=480,hh=100,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-hh*0.5f;
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);glColor4f(0,0,0,0.92f);
+    glBegin(GL_QUADS);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+hh);glVertex2f(x,y+hh);glEnd();glDisable(GL_BLEND);
+    glColor3f(0.9f,0.6f,0.3f);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+hh);glVertex2f(x,y+hh);glEnd();
+    glColor3f(1,1,1);FONT.at2d(x+14,y+20,"La mascara no pertenece al audio abierto.");
+    FONT.at2d(x+14,y+40,"Desea abrirla de todas formas?");
+    // boton "Abrir"
+    float bx0=x+w*0.5f-130, bx1=bx0+110, by0=y+hh-38, by1=by0+26;
+    glColor4f(0.2f,0.55f,0.3f,0.9f);glEnable(GL_BLEND);glBegin(GL_QUADS);glVertex2f(bx0,by0);glVertex2f(bx1,by0);glVertex2f(bx1,by1);glVertex2f(bx0,by1);glEnd();glDisable(GL_BLEND);
+    glColor3f(1,1,1);FONT.at2d(bx0+30,by0+7,"Abrir");
+    // boton "Cerrar"
+    float cx0=bx1+20, cx1=cx0+110;
+    glColor4f(0.55f,0.2f,0.2f,0.9f);glEnable(GL_BLEND);glBegin(GL_QUADS);glVertex2f(cx0,by0);glVertex2f(cx1,by0);glVertex2f(cx1,by1);glVertex2f(cx0,by1);glEnd();glDisable(GL_BLEND);
+    glColor3f(1,1,1);FONT.at2d(cx0+28,by0+7,"Cerrar"); }
+
 // modal de BUFFER: barra para ajustar el buffer (suavizado) de la etiqueta poligono
 static void render_buffer_modal(){ if(!A.buffering)return; ortho2d();
     float w=400,hh=90,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-45; char b[48];
@@ -1427,6 +1549,31 @@ static void render_buffer_modal(){ if(!A.buffering)return; ortho2d();
     float hx=tx0+(float)A.autoBuffer/BUF_MAX*(tx1-tx0);                                                          // relleno + manija
     glColor3f(0.4f,0.7f,1.f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(tx0,ty);glVertex2f(hx,ty);glEnd();
     glColor3f(1,1,1);glBegin(GL_QUADS);glVertex2f(hx-5,ty-8);glVertex2f(hx+5,ty-8);glVertex2f(hx+5,ty+8);glVertex2f(hx-5,ty+8);glEnd();
+    glDisable(GL_BLEND); }
+
+// modal de refinamiento (opening morfológico)
+static void render_refine_modal(){ if(!A.refining)return; ortho2d();
+    float w=400,hh=110,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-55; char b[64];
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);glColor4f(0,0,0,0.92f);
+    glBegin(GL_QUADS);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+hh);glVertex2f(x,y+hh);glEnd();
+    glColor3f(0.6f,0.8f,1.f);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+hh);glVertex2f(x,y+hh);glEnd();
+    snprintf(b,64,"Afinar: radio = %d  (min %d vecinos)",A.refineRadius,max(1,A.refineRadius));
+    glColor3f(1,1,1); FONT.at2d(x+14,y+16,b);
+    snprintf(b,64,"Densidad minima: %.0f%%",A.refineDensity*100.f);
+    FONT.at2d(x+14,y+36,b);
+    FONT.at2d(x+14,y+hh-8,"Enter=aplica | Esc=cancela");
+    // slider 1: radio
+    float tx0,tx1,ty; refine_slider(tx0,tx1,ty);
+    glColor3f(0.3f,0.3f,0.36f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(tx0,ty);glVertex2f(tx1,ty);glEnd();
+    float hx=tx0+(float)A.refineRadius/REFINE_MAX*(tx1-tx0);
+    glColor3f(0.4f,0.7f,1.f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(tx0,ty);glVertex2f(hx,ty);glEnd();
+    glColor3f(1,1,1);glBegin(GL_QUADS);glVertex2f(hx-5,ty-8);glVertex2f(hx+5,ty-8);glVertex2f(hx+5,ty+8);glVertex2f(hx-5,ty+8);glEnd();
+    // slider 2: densidad
+    float dx0,dx1,dy; refine_density_slider(dx0,dx1,dy);
+    glColor3f(0.3f,0.3f,0.36f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(dx0,dy);glVertex2f(dx1,dy);glEnd();
+    float dhx=dx0+A.refineDensity*(dx1-dx0);
+    glColor3f(0.7f,0.5f,0.3f);glLineWidth(4.f);glBegin(GL_LINES);glVertex2f(dx0,dy);glVertex2f(dhx,dy);glEnd();
+    glColor3f(1,1,1);glBegin(GL_QUADS);glVertex2f(dhx-5,dy-8);glVertex2f(dhx+5,dy-8);glVertex2f(dhx+5,dy+8);glVertex2f(dhx-5,dy+8);glEnd();
     glDisable(GL_BLEND); }
 
 // panel "Acerca de / Contacto" (clic o Esc para cerrar)
@@ -1529,7 +1676,7 @@ static void render(){ glClearColor(0.04f,0.03f,0.06f,1); glViewport(0,0,A.cW,A.c
         render_filter_bars();                                               // barras de filtro en TODAS las vistas (V7 = filtros locales)
         if(A.dragging&&(A.dragRegion==2||A.dragRegion==3)){ortho2d();glColor3f(1,1,1);glLineWidth(1.f);glBegin(GL_LINE_LOOP);glVertex2f(A.dx0,A.dy0);glVertex2f(A.dx1,A.dy0);glVertex2f(A.dx1,A.dy1);glVertex2f(A.dx0,A.dy1);glEnd();}
     } else { ortho2d(); glColor3f(1,1,1); FONT.at2d(20,A.cH/2,"Pulsa 'Abrir' (tecla o) o ARRASTRA un WAV aqui para cargarlo..."); }
-    render_toolbar(); render_hud(); render_cursor_readout(); render_label_list(); render_cmap_dropdown(); render_tooltip(); render_naming(); render_buffer_modal(); render_about(); }
+    render_toolbar(); render_hud(); render_cursor_readout(); render_label_list(); render_cmap_dropdown(); render_tooltip(); render_naming(); render_buffer_modal(); render_refine_modal(); render_about(); render_mask_prompt(); }
 
 // ---------------- acciones ----------
 // historial para Ctrl+Z: guarda una instantanea de las etiquetas ANTES de modificarlas.
@@ -1715,6 +1862,7 @@ static std::string mask_path_for_current(){ std::string stem=A.fname; { size_t p
     if(stem.empty()||stem=="(sin archivo)")stem="etiquetas"; return A.out_dir+"/"+stem+"_mask.bmp"; }
 static void export_background_mask(){
     if(A.spec.W<1) return;
+    show_busy("Exportando mascara de fondo...");
     int W=A.spec.W, H=A.spec.H;
     RGBImg mask(W,H);
     bool hasMask=!A.eraserMask.empty();
@@ -1741,6 +1889,26 @@ static void load_background_mask(){
     A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
     upload_texture();
     std::cout<<"Mascara de fondo cargada: "<<path<<"\n"; }
+// cargar mascara desde un path arbitrario (para drag-and-drop de BMP)
+static bool load_mask_from_path(const std::string& path){
+    if(A.spec.W<1){ std::cout<<"No hay audio cargado para aplicar mascara\n"; return false; }
+    RGBImg mask=read_bmp(path);
+    if(mask.W<1||mask.H<1){ std::cout<<"Error al leer mascara BMP: "<<path<<"\n"; return false; }
+    if(mask.W!=A.spec.W||mask.H!=A.spec.H){ std::cout<<"Dimensiones de mascara no coinciden: "<<mask.W<<"x"<<mask.H<<" vs "<<A.spec.W<<"x"<<A.spec.H<<"\n"; return false; }
+    int W=mask.W, H=mask.H;
+    A.eraserMask.resize((size_t)W*H);
+    for(int r=0;r<H;++r) for(int c=0;c<W;++c){
+        size_t i=((size_t)r*W+c)*3;
+        A.eraserMask[r*W+c]=(mask.d[i]>128||mask.d[i+1]>128||mask.d[i+2]>128)?1:0; }
+    A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+    upload_texture();
+    std::cout<<"Mascara cargada: "<<path<<"\n";
+    return true; }
+// extraer stem (nombre sin extension) de un path
+static std::string stem_from_path(const std::string& path){
+    std::string base=path; { size_t p=base.find_last_of("/\\"); if(p!=std::string::npos)base=base.substr(p+1); }
+    size_t dp=base.find_last_of('.'); if(dp!=std::string::npos)base=base.substr(0,dp);
+    return base; }
 // firma (hash) del estado de etiquetas: detecta CUALQUIER cambio para el autosave
 // Cache: solo recalcula cuando labelsSigDirty=true (marca invalidate_dets_caches).
 static unsigned long long compute_labels_sig(){ unsigned long long s=1469598103934665603ULL;
@@ -1766,13 +1934,35 @@ static void cargar_raven(){
     if(g_dialogOpen){ if(g_hwnd)SetForegroundWindow(g_hwnd); return; }   // ya hay un dialogo abierto -> traer al frente, NO abrir otro
     g_dialogOpen=true;
     char f[MAX_PATH]=""; OPENFILENAMEA o{}; o.lStructSize=sizeof(o); o.hwndOwner=g_hwnd;
-    o.lpstrFilter="Raven selection table\0*.txt\0Todos\0*.*\0"; o.lpstrFile=f; o.nMaxFile=MAX_PATH;
+    o.lpstrFilter="Raven / Mascara\0*.txt;*_mask.bmp\0Raven (.txt)\0*.txt\0Mascara (.bmp)\0*mask.bmp\0Todos\0*.*\0";
+    o.lpstrFile=f; o.nMaxFile=MAX_PATH;
     o.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST; bool ok=GetOpenFileNameA(&o)!=0; g_dialogOpen=false;
     if(!ok)return; if(A.spec.W<1)return;
-    show_busy("Cargando etiquetas Raven...");
-    RavenGeom g{A.spec.W,A.spec.H,A.sr,A.P.hop};
-    std::vector<Det> in=import_raven(f,g,A.classes); for(auto&d:in)A.dets.push_back(d);
-    A.sel=-1; layout_botones(); invalidate_dets_caches(); std::cout<<"Cargadas "<<in.size()<<" etiquetas Raven de "<<f<<"\n"; }
+    // detectar extension
+    std::string path(f);
+    std::string ext=""; { size_t p=path.find_last_of('.'); if(p!=std::string::npos)ext=path.substr(p); }
+    // convertir a minusculas
+    for(auto&c:ext) if(c>='A'&&c<='Z') c=c-'A'+'a';
+    if(ext==".bmp" || ext==".BMP"){
+        // --- cargar mascara BMP ---
+        RGBImg mask=read_bmp(path);
+        if(mask.W<1||mask.H<1){ std::cout<<"Error al leer mascara BMP: "<<path<<"\n"; return; }
+        if(mask.W!=A.spec.W||mask.H!=A.spec.H){ std::cout<<"Dimensiones de mascara no coinciden: "<<mask.W<<"x"<<mask.H<<" vs "<<A.spec.W<<"x"<<A.spec.H<<"\n"; return; }
+        A.eraserMask.resize((size_t)mask.W*mask.H);
+        for(int r=0;r<mask.H;++r) for(int c=0;c<mask.W;++c){
+            size_t i=((size_t)r*mask.W+c)*3;
+            A.eraserMask[r*mask.W+c]=(mask.d[i]>128||mask.d[i+1]>128||mask.d[i+2]>128)?1:0; }
+        A.prevDbMin=A.dbMin; A.prevDbMax=A.dbMax; A.prevFLo=A.fLo; A.prevFHi=A.fHi;
+        upload_texture();
+        std::cout<<"Mascara de fondo cargada: "<<path<<"\n";
+    } else {
+        // --- cargar Raven .txt ---
+        show_busy("Cargando etiquetas Raven...");
+        RavenGeom g{A.spec.W,A.spec.H,A.sr,A.P.hop};
+        std::vector<Det> in=import_raven(f,g,A.classes); for(auto&d:in)A.dets.push_back(d);
+        A.sel=-1; layout_botones(); invalidate_dets_caches(); std::cout<<"Cargadas "<<in.size()<<" etiquetas Raven de "<<f<<"\n";
+    }
+}
 static void crear_caja(int cls){ if(A.sc0<0||A.sc1<=A.sc0)return; push_undo(); Det d; d.x=A.sc0; d.w=A.sc1-A.sc0;
     if(A.sr0>=0&&A.sr1>=0){d.y=min(A.sr0,A.sr1);d.h=max(1,std::abs(A.sr1-A.sr0));}else{d.y=0;d.h=A.spec.H;}
     d.px={d.x,d.x+d.w,d.x+d.w,d.x}; d.py={d.y,d.y,d.y+d.h,d.y+d.h}; d.cls=cls;
@@ -1794,10 +1984,10 @@ static void zoom2d(float factor,int cc,int cr){ int W=A.spec.W,H=A.spec.H; if(W<
     int nv0=cc-(int)(fx*ncw); nv0=max(0,min(W-ncw,nv0)); A.vc0=nv0; A.vc1=nv0+ncw;
     int nr0=cr-(int)(fy*nch); nr0=max(0,min(H-nch,nr0)); A.vr0=nr0; A.vr1=nr0+nch; }
 static void do_action(int c){
-    if(c=='q')PostQuitMessage(0);
+    if(c=='q'){ if(A.spec.W>0) close_audio(); else PostQuitMessage(0); }
     else if(c=='f')set_signal_value();   // fija el techo escuchado como piso de senal
     else if(c>='1'&&c<='7'){ A.view=c-'0'; layout_botones(); }   // relayout: botones segun la vista (1-7)
-    else if(c=='G')A.quiver_completo=!A.quiver_completo;          // Quiver: glifos completos
+    else if(c=='Q')A.quiver_completo=!A.quiver_completo;          // Quiver: glifos completos
     else if(c=='B')A.solo_banda=!A.solo_banda;
     else if(c=='v'){ A.playSpeed=max(0.1f,A.playSpeed-0.1f); A.playSpeed=roundf(A.playSpeed*10.f)/10.f; A.refilterPending=true; }   // mas lento (-0.1x)
     else if(c=='V'){ A.playSpeed=min(4.0f,A.playSpeed+0.1f); A.playSpeed=roundf(A.playSpeed*10.f)/10.f; A.refilterPending=true; }   // mas rapido (+0.1x)
@@ -1849,9 +2039,11 @@ static void do_action(int c){
     else if(c=='c'){push_undo();A.dets.clear();A.hilos.clear();A.sel=-1;A.polyX.clear();A.polyY.clear();A.cutX.clear();A.cutY.clear();A.selDet=A.selVert=-1;A.selVerts.clear();A.listSel.clear();invalidate_dets_caches();}
     else if(c=='s')guardar();
     else if(c=='K')export_background_mask();   // exportar mascara de fondo
+    else if(c=='F'){ A.refining=!A.refining; }   // abrir/cerrar modal de refinamiento
+    else if(c=='h'){ A.show_mask=!A.show_mask; upload_texture(); }   // mostrar/ocultar mascara del borrador
 }
 static void ayuda(){ std::cout<<"\n=== raven.exe ===\n Botones arriba o teclas: o abrir, 1-5 vistas, ESPACIO play sel, p todo, k pausa, . stop,\n"
-    " a auto, l caja, t hilo, b/n clase, z asig cl, d borrador, Supr borra, c limpia, s guarda, K mascara fondo, r ejes(3D), q salir.\n"
+    " a auto, l caja, t hilo, b/n clase, z asig cl, d borrador, G clic forma, F afinar, h ver mascara, Supr borra, c limpia, s guarda, K mascara fondo, r ejes(3D), q salir.\n"
     " Etiqueta arrastrando en la vista 2D o en la tira inferior (sirve en 3D). Arrastrar selecciona\n"
     " tiempo+frecuencia; ESPACIO reproduce SOLO esa banda. Clic simple = mover playhead (seek).\n"; }
 
@@ -2301,19 +2493,42 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
     switch(m){
     case WM_SIZE: A.cW=LOWORD(lp); A.cH=HIWORD(lp); layout_botones(); return 0;
     case WM_SETCURSOR: if(LOWORD(lp)==HTCLIENT){ POINT p; GetCursorPos(&p); ScreenToClient(h,&p); A.mx=p.x;A.my=p.y; SetCursor(pick_cursor()); return TRUE; } break;
-    case WM_DROPFILES:{ HDROP hdrop=(HDROP)wp; char path[MAX_PATH]="";   // ARRASTRAR Y SOLTAR: abre el WAV soltado sobre la ventana
-        UINT got=DragQueryFileA(hdrop,0,path,MAX_PATH); DragFinish(hdrop);   // toma el PRIMER archivo soltado
-        if(got>0){ std::string p=path; size_t n=p.size();                    // solo intenta abrir si termina en .wav (insensible a mayusculas)
+    case WM_DROPFILES:{ HDROP hdrop=(HDROP)wp; char path[MAX_PATH]="";   // ARRASTRAR Y SOLTAR: abre el WAV o BMP soltado sobre la ventana
+        UINT got=DragQueryFileA(hdrop,0,path,MAX_PATH); DragFinish(hdrop);
+        if(got>0){ std::string p=path; size_t n=p.size();
             bool isWav = n>=4 && p[n-4]=='.' && (p[n-3]=='w'||p[n-3]=='W') && (p[n-2]=='a'||p[n-2]=='A') && (p[n-1]=='v'||p[n-1]=='V');
-            if(isWav){ SetForegroundWindow(h); load_audio(p); } }
+            bool isBmp = n>=4 && p[n-4]=='.' && (p[n-3]=='b'||p[n-3]=='B') && (p[n-2]=='m'||p[n-2]=='M') && (p[n-1]=='p'||p[n-1]=='P');
+            if(isWav){ SetForegroundWindow(h); load_audio(p); }
+            else if(isBmp){ SetForegroundWindow(h);
+                if(A.spec.W<1){ MessageBoxA(h,"No hay un audio cargado. Abra un WAV primero.","Mascara",MB_OK|MB_ICONWARNING); return 0; }
+                std::string bmpStem=stem_from_path(p);
+                std::string audioStem=stem_from_path(A.fname);
+                bool match=(bmpStem.size()>=5 && bmpStem.substr(bmpStem.size()-5)=="_mask" && bmpStem.substr(0,bmpStem.size()-5)==audioStem);
+                if(match){ load_mask_from_path(p); }
+                else { A.maskPromptOpen=true; A.maskPromptPath=p; } } }
         return 0; }
     case WM_LBUTTONDOWN:{ int mx=LOWORD(lp),my=HIWORD(lp);
         if(A.showAbout){ A.showAbout=false; return 0; }                          // cualquier clic cierra el panel Acerca de
+        if(A.maskPromptOpen){ float w=480,x=A.cW*0.5f-w*0.5f,y=A.cH*0.5f-50;
+            float bx0=x+w*0.5f-130,bx1=bx0+110,by0=y+62,by1=by0+26;            // boton "Abrir"
+            float cx0=bx1+20,cx1=cx0+110;                                       // boton "Cerrar"
+            if(mx>=bx0&&mx<=bx1&&my>=by0&&my<=by1){ load_mask_from_path(A.maskPromptPath); A.maskPromptOpen=false; }
+            else if(mx>=cx0&&mx<=cx1&&my>=by0&&my<=by1){ A.maskPromptOpen=false; }
+            else { A.maskPromptOpen=false; } return 0; }                        // cualquier otro clic cierra
         if(A.cmapOpen){ int ci=cmap_item_at(mx,my);                              // combo de mapa de color abierto
             if(ci>=0){ A.cmap=ci; build_cmap(); upload_texture(); }              // elige paleta -> reconstruye LUT y textura
             A.cmapOpen=false; return 0; }                                        // cualquier clic cierra el combo
         if(A.buffering){ float tx0,tx1,ty; bufslider(tx0,tx1,ty);                 // modal de buffer: arrastra la barra
             if(mx>=tx0-8&&mx<=tx1+8&&my>=ty-14&&my<=ty+14){ A.dragging=true; A.dragRegion=22; buffer_apply(mx); } return 0; }
+        if(A.refining){ float tx0,tx1,ty; refine_slider(tx0,tx1,ty);             // modal de refinamiento: arrastra la barra de radio
+            if(mx>=tx0-8&&mx<=tx1+8&&my>=ty-14&&my<=ty+14){ A.dragging=true; A.dragRegion=24;
+                float v=(mx-tx0)/(tx1-tx0>1?tx1-tx0:1); v=v<0?0:(v>1?1:v);
+                A.refineRadius=max(1,min(REFINE_MAX,(int)(v*REFINE_MAX+0.5f))); return 0; }
+            float dx0,dx1,dy; refine_density_slider(dx0,dx1,dy);              // barra de densidad
+            if(mx>=dx0-8&&mx<=dx1+8&&my>=dy-14&&my<=dy+14){ A.dragging=true; A.dragRegion=25;
+                float v=(mx-dx0)/(dx1-dx0>1?dx1-dx0:1); v=v<0?0:(v>1?1:v);
+                A.refineDensity=v; return 0; }
+            return 0; }
         if(A.listOpen){ float lx,ly,lw,lh; list_rect(lx,ly,lw,lh);   // LISTA de etiquetas: clics dentro del panel
             if(mx>=lx&&mx<=lx+lw&&my>=ly&&my<=ly+lh){
                 if(my<ly+LIST_HH){ A.listSortSize=!A.listSortSize; return 0; }   // cabecera = alterna orden (id / tamano)
@@ -2395,6 +2610,12 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
             A.ax[A.scaleAxis]=max(0.4f,min(14.f,A.ax[A.scaleAxis]+(float)proj*0.012f)); }
         else if(A.dragRegion==30){ scroll_center(mx); }                           // barra de scroll horizontal: mueve la ventana
         else if(A.dragRegion==22){ buffer_apply(mx); }                            // modal de buffer
+        else if(A.dragRegion==24){ float tx0,tx1,ty; refine_slider(tx0,tx1,ty);   // modal de refinamiento: radio
+            float v=(mx-tx0)/(tx1-tx0>1?tx1-tx0:1); v=v<0?0:(v>1?1:v);
+            A.refineRadius=max(1,min(REFINE_MAX,(int)(v*REFINE_MAX+0.5f))); }
+        else if(A.dragRegion==25){ float dx0,dx1,dy; refine_density_slider(dx0,dx1,dy);   // densidad
+            float v=(mx-dx0)/(dx1-dx0>1?dx1-dx0:1); v=v<0?0:(v>1?1:v);
+            A.refineDensity=v; }
         else if(A.dragRegion==7){ int c,r; main_to_spec(mx,my,c,r);
             if(A.tool==T_ERASER){ if(A.eraserDragging){ eraser_line(A.eraserPrevC,A.eraserPrevR,c,r); A.eraserPrevC=c; A.eraserPrevR=r; upload_texture(); } }
             else if(A.cutX.empty()||A.cutX.back()!=c||A.cutY.back()!=r){A.cutX.push_back(c);A.cutY.push_back(r);} }  // pinta trazo de corte
@@ -2421,6 +2642,8 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         bool click=(std::abs(A.dx1-A.dx0)<4&&std::abs(A.dy1-A.dy0)<4);
         if(A.navMode||A.dragRegion==5||A.dragRegion==6){ A.navMode=0; A.scaleAxis=-1; return 0; }  // ventana/divisor/manija eje
         if(A.dragRegion==22){A.dragRegion=0;return 0;}                        // modal de buffer
+        if(A.dragRegion==24){A.dragRegion=0;return 0;}                        // modal de refinamiento (radio)
+        if(A.dragRegion==25){A.dragRegion=0;return 0;}                        // modal de refinamiento (densidad)
         if(A.dragRegion==30){A.dragRegion=0;return 0;}                        // barra de scroll horizontal
         if(A.dragRegion>=8&&A.dragRegion<=12){A.dragRegion=0;return 0;}        // barras de filtro / ganancia
         if(A.dragRegion==21){A.dragRegion=0;A.editVert=-1;A.editHole=-1;return 0;}   // editar
@@ -2617,8 +2840,10 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
             int n=delete_in_selection(); if(n)std::cout<<"Borradas "<<n<<" etiquetas (seleccion)\n"; else A.undo.pop_back(); return 0; }  // sin etiqueta sel.: borra por rectangulo de seleccion (o descarta el snapshot)
         if(wp==VK_ESCAPE){   // Esc: cancela el modo activo; NUNCA cierra la ventana (se sale con 'q')
             if(A.showAbout)A.showAbout=false;                                      // cierra el panel Acerca de
+            else if(A.maskPromptOpen)A.maskPromptOpen=false;                       // cierra el prompt de mascara
             else if(A.cmapOpen)A.cmapOpen=false;                                   // cierra el combo de mapa de color
             else if(A.buffering){ if(A.bufSel>=0&&A.bufSel<(int)A.dets.size())A.dets[A.bufSel]=A.bufOrig; A.autoBuffer=A.bufOrigBuf; A.buffering=false; }  // cancela: restaura
+            else if(A.refining)A.refining=false;
             else if(A.naming)A.naming=false; else if(!A.polyX.empty()){A.polyX.clear();A.polyY.clear();} else if(!A.cutX.empty()){A.cutX.clear();A.cutY.clear();}
             else if(A.tool==T_EDIT){ A.tool=T_SELECT; A.selDet=A.selVert=-1; A.selVerts.clear(); A.editVert=-1; A.editHole=-1; }   // Esc DESACTIVA la edicion
             else { A.selVerts.clear(); A.selDet=A.selVert=-1; A.sc0=A.sc1=A.sr0=A.sr1=-1; }   // limpia marcas/seleccion
@@ -2627,9 +2852,13 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         if((GetKeyState(VK_CONTROL)&0x8000)&&(wp==VK_OEM_PLUS||wp==VK_ADD||wp=='='||wp=='+')){ grow_selected_label(); return 0; }
         // Ctrl + -: achicar etiqueta seleccionada
         if((GetKeyState(VK_CONTROL)&0x8000)&&(wp==VK_OEM_MINUS||wp==VK_SUBTRACT||wp=='-')){ shrink_selected_label(); return 0; }
+        // modal refinamiento: +/- ajustan radio
+        if(A.refining&&(wp==VK_OEM_PLUS||wp==VK_ADD||wp=='='||wp=='+')){ A.refineRadius=min(REFINE_MAX,A.refineRadius+1); return 0; }
+        if(A.refining&&(wp==VK_OEM_MINUS||wp==VK_SUBTRACT||wp=='-')){ A.refineRadius=max(1,A.refineRadius-1); return 0; }
         return 0;
     case WM_CHAR:
         if(A.buffering){ if((int)wp==13)A.buffering=false; return 0; }   // Enter = aplicar buffer
+        if(A.refining){ if((int)wp==13){ apply_refine(); A.refining=false; } return 0; }   // Enter = aplicar refinamiento
         if(A.naming){ int ch=(int)wp;
             if(ch==13){ if(!A.nameBuf.empty())add_class(A.nameBuf); A.naming=false; layout_botones(); }
             else if(ch==27)A.naming=false;
@@ -2640,10 +2869,11 @@ static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM wp,LPARAM lp){
         if((GetKeyState(VK_CONTROL)&0x8000)&&((int)wp=='+'||(int)wp=='=')){ grow_selected_label(); return 0; }
         // Ctrl + -: achicar etiqueta
         if((GetKeyState(VK_CONTROL)&0x8000)&&(int)wp=='-'){ shrink_selected_label(); return 0; }
-        if((int)wp==26){ do_undo(); return 0; }   // Ctrl+Z llega como WM_CHAR 0x1A
-        if((int)wp==25){ do_redo(); return 0; }   // Ctrl+Y llega como WM_CHAR 0x19
         if((int)wp==13){ if(!A.polyX.empty())finish_poly(); return 0; }   // Enter cierra el poligono a mano
         do_action((int)wp); return 0;
+    case WM_CLOSE:
+        if(A.spec.W>0){ close_audio(); return 0; }   // hay audio: cerrar audio, mantener ventana
+        PLAYER.stop(); DestroyWindow(h); return 0;    // sin audio: cerrar programa
     case WM_DESTROY: PLAYER.stop(); PostQuitMessage(0); return 0;
     }
     return DefWindowProc(h,m,wp,lp);
